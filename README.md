@@ -13,8 +13,9 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Implementation Status](#implementation-status)
 - [Architecture](#architecture)
-- [Core Capabilities](#core-capabilities)
+- [Target MVP Capabilities](#target-mvp-capabilities)
 - [API](#api)
 - [Job Lifecycle](#job-lifecycle)
 - [Reliability and Failure Handling](#reliability-and-failure-handling)
@@ -43,7 +44,17 @@ This project moves that responsibility into one small internal service. A busine
 
 ---
 
+## Implementation Status
+
+**Batch 1 is complete.** The repository currently includes the FastAPI application skeleton, environment-based configuration, the PostgreSQL job model, an Alembic migration, a database-backed health check, and unit tests.
+
+Notification submission, status lookup, outbound delivery, and the worker lifecycle are target behavior documented below. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
+
+---
+
 ## Architecture
+
+The following diagram shows the target MVP architecture. Batch 1 currently implements the FastAPI, PostgreSQL schema, and health-check foundation.
 
 ```text
 ┌─────────────────────┐       POST /notifications
@@ -79,7 +90,7 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 
 ---
 
-## Core Capabilities
+## Target MVP Capabilities
 
 - **Asynchronous submission**: returns `202 Accepted` after a job is stored instead of waiting for the external API.
 - **Flexible requests**: accepts a target URL, an allow-listed HTTP method, headers, and a JSON body.
@@ -94,7 +105,24 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 
 ## API
 
-### Create a Notification
+### Health Check — Implemented
+
+```http
+GET /health
+```
+
+The endpoint verifies that the API can execute a simple PostgreSQL query.
+
+```json
+{
+  "status": "ok",
+  "database": "ok"
+}
+```
+
+It returns `503 Service Unavailable` when the database cannot be reached.
+
+### Create a Notification — Planned for Batch 2
 
 ```http
 POST /notifications
@@ -130,7 +158,7 @@ HTTP/1.1 202 Accepted
 
 `Idempotency-Key` is optional. If the same key and payload are submitted again, the API returns the original job instead of creating another one. Reusing a key with a different payload returns `409 Conflict`.
 
-### Get Notification Status
+### Get Notification Status — Planned for Batch 2
 
 ```http
 GET /notifications/f183bf31-53d5-42db-aeb7-42a7bfa48dc2
@@ -242,20 +270,18 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 ```text
 .
 ├── app/
-│   ├── main.py              # FastAPI application and lifecycle
-│   ├── api.py               # Notification endpoints
+│   ├── __init__.py
+│   ├── main.py              # FastAPI application entry point
+│   ├── api.py               # Health endpoint
 │   ├── config.py            # Environment-based configuration
 │   ├── database.py          # PostgreSQL session setup
 │   ├── models.py            # SQLAlchemy job model
-│   ├── schemas.py           # API request and response models
-│   ├── repository.py        # Job persistence and claiming
-│   ├── delivery.py          # Outbound HTTP and retry classification
-│   └── worker.py            # Worker process entry point
-├── migrations/              # Alembic database migrations
-├── tests/                   # API, retry, and delivery tests
+├── migrations/
+│   └── versions/            # Alembic database revisions
+├── tests/                   # Configuration, health, and model tests
 ├── .env.example             # Local configuration template
-├── docker-compose.yml       # API, worker, and PostgreSQL services
-├── Dockerfile
+├── alembic.ini              # Migration configuration
+├── docker-compose.yml       # PostgreSQL service for local development
 ├── pyproject.toml
 ├── Plan.md                  # Ordered implementation batches and exit criteria
 ├── FUNCTIONS.md             # Plain-Chinese explanation of every function
@@ -301,7 +327,7 @@ source .venv/bin/activate
 
 The `.venv` directory is local-only and is excluded from Git.
 
-### Run with Docker Compose
+### Run the Batch 1 Foundation
 
 Clone the repository and create the local environment file:
 
@@ -311,10 +337,22 @@ cd rc_<your_nickname>
 cp .env.example .env
 ```
 
-Start PostgreSQL, the API, and the worker:
+Start PostgreSQL:
 
 ```bash
-docker compose up --build
+docker compose up -d db
+```
+
+Apply the database migration:
+
+```bash
+uv run alembic upgrade head
+```
+
+Start the API:
+
+```bash
+uv run uvicorn app.main:app --reload
 ```
 
 Default local endpoints:
@@ -326,34 +364,30 @@ Default local endpoints:
 ### Run Tests
 
 ```bash
-docker compose run --rm api pytest
+uv run ruff check .
+uv run pytest
 ```
 
 ---
 
 ## Quick Smoke Test
 
-Create a notification:
+With PostgreSQL and the API running, check the current Batch 1 endpoint:
 
 ```bash
-curl -i -X POST http://localhost:8000/notifications \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: smoke-test-1' \
-  -d '{
-    "target_url": "https://httpbin.org/status/200",
-    "method": "POST",
-    "headers": {},
-    "body": {"event": "payment.succeeded"}
-  }'
+curl -i http://localhost:8000/health
 ```
 
-Copy the returned `id` and inspect the job:
+Expected body:
 
-```bash
-curl http://localhost:8000/notifications/<notification-id>
+```json
+{
+  "status": "ok",
+  "database": "ok"
+}
 ```
 
-After the worker processes the job, its status should become `succeeded`.
+The notification creation and delivery smoke test will be added when those batches are implemented.
 
 ---
 
