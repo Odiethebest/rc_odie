@@ -2,6 +2,25 @@
 
 这份文档用简单中文解释项目中的每一个函数。它的目的不是重复代码，而是让第一次阅读项目的人快速知道：这个函数为什么存在、接收什么、返回什么，以及失败时会发生什么。
 
+## 快速导航
+
+- [维护规则](#维护规则)
+- [记录格式](#记录格式)
+- [当前函数目录](#当前函数目录)
+- [主要类和数据结构](#主要类和数据结构)
+- [应用代码函数](#应用代码函数)
+  - [配置：app/config.py](#app-config)
+  - [数据库连接：app/database.py](#app-database)
+  - [API：app/api.py](#app-api)
+- [数据库迁移函数](#数据库迁移函数)
+  - [Alembic 运行入口](#migration-env)
+  - [Alembic 文件模板](#migration-template)
+  - [首次 migration](#migration-0001)
+- [测试函数](#测试函数)
+  - [配置测试](#test-config)
+  - [健康检查测试](#test-health)
+  - [数据模型测试](#test-models)
+
 ## 维护规则
 
 - 新增函数时，在同一次修改中补充对应说明。
@@ -16,7 +35,7 @@
 每个函数使用下面的简短格式：
 
 ```markdown
-### `function_name(parameter)`
+#### `function_name(parameter)`
 
 - **位置**：`app/example.py`
 - **用途**：用一句话说明这个函数解决什么问题。
@@ -33,15 +52,15 @@
 
 | 文件 | 函数 |
 |---|---|
-| `app/config.py` | `get_settings()` |
-| `app/database.py` | `get_session()`、`database_is_ready()` |
-| `app/api.py` | `health_check()` |
-| `migrations/env.py` | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
-| `migrations/script.py.mako` | `upgrade()`、`downgrade()` migration 模板 |
-| `migrations/versions/0001_create_notification_jobs.py` | `upgrade()`、`downgrade()` |
-| `tests/test_config.py` | `test_settings_reads_environment_variables()` |
-| `tests/test_health.py` | `test_health_returns_ok_when_database_is_ready()`、`test_health_returns_503_when_database_is_unavailable()` |
-| `tests/test_models.py` | `test_notification_job_table_contains_required_fields()`、`test_notification_status_values_are_stable()` |
+| [app/config.py](#app-config) | `get_settings()` |
+| [app/database.py](#app-database) | `get_session()`、`database_is_ready()` |
+| [app/api.py](#app-api) | `health_check()` |
+| [migrations/env.py](#migration-env) | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
+| [migrations/script.py.mako](#migration-template) | `upgrade()`、`downgrade()` migration 模板 |
+| [migrations/versions/0001_create_notification_jobs.py](#migration-0001) | `upgrade()`、`downgrade()` |
+| [tests/test_config.py](#test-config) | `test_settings_reads_environment_variables()` |
+| [tests/test_health.py](#test-health) | `test_health_returns_ok_when_database_is_ready()`、`test_health_returns_503_when_database_is_unavailable()` |
+| [tests/test_models.py](#test-models) | `test_notification_job_table_contains_required_fields()`、`test_notification_status_values_are_stable()` |
 
 ## 主要类和数据结构
 
@@ -57,9 +76,13 @@
 
 ---
 
-## `app/config.py`
+## 应用代码函数
 
-### `get_settings()`
+<a id="app-config"></a>
+
+### 配置：`app/config.py`
+
+#### `get_settings()`
 
 - **用途**：取得当前进程使用的应用配置。
 - **输入**：无；配置来自环境变量或项目根目录的 `.env`。
@@ -70,9 +93,11 @@
 
 ---
 
-## `app/database.py`
+<a id="app-database"></a>
 
-### `get_session()`
+### 数据库连接：`app/database.py`
+
+#### `get_session()`
 
 - **用途**：为一次 API 操作提供独立的异步数据库 session。
 - **输入**：无。
@@ -81,7 +106,7 @@
 - **失败情况**：连接或 SQL 操作失败时，错误交给实际调用数据库的业务函数处理。
 - **副作用**：可能打开和关闭 PostgreSQL 连接。
 
-### `database_is_ready()`
+#### `database_is_ready()`
 
 - **用途**：判断 PostgreSQL 当前是否可以正常响应。
 - **输入**：无。
@@ -92,9 +117,11 @@
 
 ---
 
-## `app/api.py`
+<a id="app-api"></a>
 
-### `health_check()`
+### API：`app/api.py`
+
+#### `health_check()`
 
 - **用途**：实现 `GET /health`，同时检查 API 和数据库是否可用。
 - **输入**：无。
@@ -105,9 +132,13 @@
 
 ---
 
-## `migrations/env.py`
+## 数据库迁移函数
 
-### `run_migrations_offline()`
+<a id="migration-env"></a>
+
+### Alembic 运行入口：`migrations/env.py`
+
+#### `run_migrations_offline()`
 
 - **用途**：在不连接数据库时生成 migration SQL。
 - **输入**：无；使用 Alembic 当前配置和 SQLAlchemy metadata。
@@ -116,7 +147,7 @@
 - **失败情况**：配置或 migration 文件不合法时由 Alembic 报错。
 - **副作用**：生成 SQL 输出，不修改数据库。
 
-### `do_run_migrations(connection)`
+#### `do_run_migrations(connection)`
 
 - **用途**：通过已经建立的连接真正执行 migration。
 - **输入**：Alembic 可使用的同步 `connection` 包装。
@@ -125,7 +156,7 @@
 - **失败情况**：SQL 执行失败时事务回滚，错误继续交给 Alembic 显示。
 - **副作用**：可能创建、修改或删除数据库结构。
 
-### `run_async_migrations()`
+#### `run_async_migrations()`
 
 - **用途**：让 Alembic 可以通过项目的 asyncpg 数据库地址执行 migration。
 - **输入**：无；读取当前 `DATABASE_URL`。
@@ -134,7 +165,7 @@
 - **失败情况**：连接或 migration 失败时向上抛错，命令以失败状态结束。
 - **副作用**：连接 PostgreSQL，并可能修改数据库结构。
 
-### `run_migrations_online()`
+#### `run_migrations_online()`
 
 - **用途**：从 Alembic 的同步入口启动异步 migration 流程。
 - **输入**：无。
@@ -145,11 +176,13 @@
 
 ---
 
-## `migrations/script.py.mako`
+<a id="migration-template"></a>
+
+### Alembic 文件模板：`migrations/script.py.mako`
 
 这个文件是 Alembic 创建新 migration 时使用的模板，不会作为应用代码直接运行。
 
-### `upgrade()`
+#### `upgrade()`
 
 - **用途**：为新 migration 生成“向前升级”函数的位置。
 - **输入**：无；模板内容由 Alembic 生成命令填入。
@@ -158,7 +191,7 @@
 - **失败情况**：模板本身不执行；生成后的 migration 失败时由 Alembic 报错。
 - **副作用**：模板阶段无；生成后的函数可能修改数据库结构。
 
-### `downgrade()`
+#### `downgrade()`
 
 - **用途**：为新 migration 生成“撤销升级”函数的位置。
 - **输入**：无；模板内容由 Alembic 生成命令填入。
@@ -169,9 +202,11 @@
 
 ---
 
-## `migrations/versions/0001_create_notification_jobs.py`
+<a id="migration-0001"></a>
 
-### `upgrade()`
+### 首次 migration：`migrations/versions/0001_create_notification_jobs.py`
+
+#### `upgrade()`
 
 - **用途**：创建第一版 `notification_jobs` 表。
 - **输入**：无；由 Alembic 调用。
@@ -180,7 +215,7 @@
 - **失败情况**：数据库不支持操作或已有冲突结构时 migration 失败并回滚。
 - **副作用**：创建数据库表和索引。
 
-### `downgrade()`
+#### `downgrade()`
 
 - **用途**：撤销第一版 migration。
 - **输入**：无；由 Alembic 调用。
@@ -191,9 +226,13 @@
 
 ---
 
-## `tests/test_config.py`
+## 测试函数
 
-### `test_settings_reads_environment_variables(monkeypatch)`
+<a id="test-config"></a>
+
+### 配置测试：`tests/test_config.py`
+
+#### `test_settings_reads_environment_variables(monkeypatch)`
 
 - **用途**：确认环境变量可以覆盖开发环境默认配置。
 - **输入**：pytest 提供的 `monkeypatch`。
@@ -204,9 +243,11 @@
 
 ---
 
-## `tests/test_health.py`
+<a id="test-health"></a>
 
-### `test_health_returns_ok_when_database_is_ready(monkeypatch)`
+### 健康检查测试：`tests/test_health.py`
+
+#### `test_health_returns_ok_when_database_is_ready(monkeypatch)`
 
 - **用途**：确认数据库正常时健康接口返回 HTTP `200` 和预期 JSON。
 - **输入**：pytest 提供的 `monkeypatch`。
@@ -215,7 +256,7 @@
 - **失败情况**：状态码或响应内容不符合约定时测试失败。
 - **副作用**：不访问真实网络或数据库。
 
-### `test_health_returns_503_when_database_is_unavailable(monkeypatch)`
+#### `test_health_returns_503_when_database_is_unavailable(monkeypatch)`
 
 - **用途**：确认数据库故障会被清楚地反映为 HTTP `503`。
 - **输入**：pytest 提供的 `monkeypatch`。
@@ -226,9 +267,11 @@
 
 ---
 
-## `tests/test_models.py`
+<a id="test-models"></a>
 
-### `test_notification_job_table_contains_required_fields()`
+### 数据模型测试：`tests/test_models.py`
+
+#### `test_notification_job_table_contains_required_fields()`
 
 - **用途**：防止任务表的重要字段、约束或索引被意外删除。
 - **输入**：无。
@@ -237,7 +280,7 @@
 - **失败情况**：模型结构与预期不一致时测试失败。
 - **副作用**：无；不连接数据库。
 
-### `test_notification_status_values_are_stable()`
+#### `test_notification_status_values_are_stable()`
 
 - **用途**：保证 Python 中的任务状态与数据库约束使用相同的五个值。
 - **输入**：无。
