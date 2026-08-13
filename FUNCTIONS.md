@@ -14,6 +14,7 @@
   - [API：app/api.py](#app-api)
   - [请求与响应模型：app/schemas.py](#app-schemas)
   - [数据库操作：app/repository.py](#app-repository)
+  - [HTTP 投递：app/delivery.py](#app-delivery)
 - [数据库迁移函数](#数据库迁移函数)
   - [Alembic 运行入口](#migration-env)
   - [Alembic 文件模板](#migration-template)
@@ -25,6 +26,7 @@
   - [请求模型测试](#test-schemas)
   - [数据库操作测试](#test-repository)
   - [通知 API 测试](#test-notifications-api)
+  - [HTTP 投递测试](#test-delivery)
 
 ## 维护规则
 
@@ -62,6 +64,7 @@
 | [app/api.py](#app-api) | `health_check()`、`create_notification()`、`get_notification_status()` |
 | [app/schemas.py](#app-schemas) | `normalize_method()`、`validate_headers()` |
 | [app/repository.py](#app-repository) | `request_matches_job()`、`get_notification()`、`get_notification_by_idempotency_key()`、`resolve_existing_notification()`、`create_notification()` |
+| [app/delivery.py](#app-delivery) | `classify_status_code()`、`build_outbound_headers()`、`bound_error_message()`、`deliver_notification()` |
 | [migrations/env.py](#migration-env) | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
 | [migrations/script.py.mako](#migration-template) | `upgrade()`、`downgrade()` migration 模板 |
 | [migrations/versions/0001_create_notification_jobs.py](#migration-0001) | `upgrade()`、`downgrade()` |
@@ -71,6 +74,7 @@
 | [tests/test_schemas.py](#test-schemas) | `test_notification_create_normalizes_method_and_url()`、`test_notification_create_rejects_invalid_input()` |
 | [tests/test_repository.py](#test-repository) | `make_job()`、`test_request_matches_job_compares_outbound_content()`、`test_resolve_existing_notification_rejects_different_request()`、`test_create_notification_commits_before_returning()` |
 | [tests/test_notifications_api.py](#test-notifications-api) | `override_session()`、`make_job()`、8 个通知 API 测试函数 |
+| [tests/test_delivery.py](#test-delivery) | `make_job()`、9 个投递测试函数 |
 
 ## 主要类和数据结构
 
@@ -89,6 +93,8 @@
 | `NotificationStatusResponse` | `app/schemas.py` | 约束查询任务状态时的完整响应 |
 | `IdempotencyConflictError` | `app/repository.py` | 表示同一个幂等 key 被用于不同请求 |
 | `CreateNotificationResult` | `app/repository.py` | 同时返回任务和“是否为本次新建”的结果 |
+| `DeliveryOutcome` | `app/delivery.py` | 定义成功、可重试失败和永久失败三种投递结果 |
+| `DeliveryResult` | `app/delivery.py` | 保存一次投递的分类、HTTP 状态码和有限长度错误信息 |
 
 ---
 
@@ -238,6 +244,48 @@
 - **主要过程**：先检查旧 key；需要新建时加入 session、提交并刷新数据库默认值。
 - **失败情况**：唯一约束竞争时先回滚，再读取并比较胜出的任务；其他数据库错误继续向上抛出。
 - **副作用**：可能新增并提交一条 PostgreSQL 记录，也可能因重复请求只读取旧记录。
+
+---
+
+<a id="app-delivery"></a>
+
+### HTTP 投递：`app/delivery.py`
+
+#### `classify_status_code(status_code)`
+
+- **用途**：把外部 API 状态码转换成 Worker 能直接处理的结果类别。
+- **输入**：一个 HTTP 状态码。
+- **返回**：成功、可重试失败或永久失败。
+- **主要过程**：`2xx` 成功；`408`、`429`、`5xx` 可重试；其余状态永久失败。
+- **失败情况**：无；无法识别为成功或临时错误的状态会安全地归为永久失败。
+- **副作用**：无。
+
+#### `build_outbound_headers(job)`
+
+- **用途**：准备外部请求 Header，并保证通知 ID 由本服务控制。
+- **输入**：一条 `NotificationJob`。
+- **返回**：新的 Header 字典。
+- **主要过程**：复制原 Header，删除调用方提供的同名通知 ID，再写入任务 UUID。
+- **失败情况**：无；任务 Header 已在创建 API 中完成格式校验。
+- **副作用**：无，不会修改任务原有 Header。
+
+#### `bound_error_message(message)`
+
+- **用途**：防止很长的网络错误被原样保存到数据库。
+- **输入**：原始错误文字。
+- **返回**：最多 500 个字符的错误文字；截断时以 `...` 结尾。
+- **主要过程**：短文字原样返回，长文字保留前部并添加截断标记。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `deliver_notification(job, client)`
+
+- **用途**：向目标地址发送一次通知，并返回结构化结果。
+- **输入**：通知任务和可复用的 `httpx.AsyncClient`。
+- **返回**：`DeliveryResult`，包含结果类别、状态码和错误文字。
+- **主要过程**：构造请求、设置 10 秒超时且不跟随跳转、发送请求，再分类状态码。
+- **失败情况**：连接错误和超时会转换成可重试结果；其他意外编程错误继续抛出。
+- **副作用**：发送一次外部 HTTP(S) 请求；不查询或修改数据库，也不保存响应 Body。
 
 ---
 
@@ -559,3 +607,99 @@
 - **主要过程**：读取 `/openapi.json`，检查 POST 创建和 GET 查询路径。
 - **失败情况**：路由没有注册或 HTTP 方法错误时测试失败。
 - **副作用**：不访问真实数据库或外部网络。
+
+---
+
+<a id="test-delivery"></a>
+
+### HTTP 投递测试：`tests/test_delivery.py`
+
+#### `make_job(**overrides)`
+
+- **用途**：为投递测试创建字段完整的内存任务。
+- **输入**：需要覆盖的任务字段。
+- **返回**：未写入数据库的 `NotificationJob`。
+- **主要过程**：填入正常 URL、Header、Body 和时间，再应用覆盖值。
+- **失败情况**：字段名称错误时 SQLAlchemy 构造函数会报错。
+- **副作用**：无。
+
+#### `test_classify_status_code_marks_2xx_success(status_code)`
+
+- **用途**：确认所有代表值范围内的 `2xx` 都被视为成功。
+- **输入**：pytest 提供的四个状态码。
+- **返回**：无。
+- **主要过程**：逐个调用分类函数并检查结果。
+- **失败情况**：任一 `2xx` 未归为成功时测试失败。
+- **副作用**：无。
+
+#### `test_classify_status_code_marks_temporary_failures_retryable(status_code)`
+
+- **用途**：确认超时、限流和服务端错误可以重试。
+- **输入**：`408`、`429` 和三个 `5xx` 代表值。
+- **返回**：无。
+- **主要过程**：逐个检查分类结果。
+- **失败情况**：任一临时错误未归为可重试时测试失败。
+- **副作用**：无。
+
+#### `test_classify_status_code_marks_other_failures_permanent(status_code)`
+
+- **用途**：确认跳转和普通客户端错误不会原样重复发送。
+- **输入**：`301` 及四个普通 `4xx` 代表值。
+- **返回**：无。
+- **主要过程**：逐个检查永久失败分类。
+- **失败情况**：任一状态被错误归为成功或可重试时测试失败。
+- **副作用**：无。
+
+#### `test_build_outbound_headers_enforces_stable_notification_id()`
+
+- **用途**：确认调用方不能覆盖本服务生成的通知 ID。
+- **输入**：无；测试内创建带伪造 ID 的任务。
+- **返回**：无。
+- **主要过程**：构建 Header，并核对伪造值已被任务 UUID 替换。
+- **失败情况**：下游收到调用方伪造值时测试失败。
+- **副作用**：无。
+
+#### `test_bound_error_message_limits_stored_text()`
+
+- **用途**：确认短错误不变，长错误最多保留 500 字符。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：分别传入短文字和超长文字并检查长度与省略号。
+- **失败情况**：信息被无故修改或超出限制时测试失败。
+- **副作用**：无。
+
+#### `test_deliver_notification_forwards_request_with_timeout()`
+
+- **用途**：确认外部请求的方法、URL、Header、JSON 和超时都正确。
+- **输入**：无；使用 httpx MockTransport 接收请求。
+- **返回**：无。
+- **主要过程**：投递 PATCH 任务，检查实际请求和成功结果。
+- **失败情况**：字段未转发、超时不是 10 秒、响应 Body 被保存或结果错误时测试失败。
+- **副作用**：只访问内存 mock，不访问互联网。
+
+#### `test_deliver_notification_classifies_http_failures(status_code, expected_outcome)`
+
+- **用途**：确认真实投递入口正确处理 `429`、`503` 和 `400`。
+- **输入**：pytest 提供状态码和预期结果。
+- **返回**：无。
+- **主要过程**：mock 外部响应并检查状态码、错误文字和结果分类。
+- **失败情况**：分类错误或敏感响应 Body 出现在结果中时测试失败。
+- **副作用**：只访问内存 mock。
+
+#### `test_deliver_notification_converts_transport_errors_to_retryable(transport_error)`
+
+- **用途**：确认连接失败和读取超时不会让投递流程崩溃。
+- **输入**：pytest 提供的两种 httpx 网络异常。
+- **返回**：无。
+- **主要过程**：让 MockTransport 抛错，再检查可重试结果和有限错误信息。
+- **失败情况**：异常逃出函数或被归为永久失败时测试失败。
+- **副作用**：只访问内存 mock。
+
+#### `test_notification_id_is_unchanged_across_attempts()`
+
+- **用途**：确认同一任务多次发送时始终使用同一个下游幂等 ID。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：让同一任务先收到 `503` 再收到 `200`，比较两次请求 Header。
+- **失败情况**：两次 ID 不同或结果分类错误时测试失败。
+- **副作用**：只访问内存 mock。

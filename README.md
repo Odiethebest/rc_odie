@@ -46,15 +46,15 @@ This project moves that responsibility into one small internal service. A busine
 
 ## Implementation Status
 
-**Batch 2 is complete.** The repository currently accepts validated notification jobs, stores them durably in PostgreSQL, handles duplicate-safe submission, and exposes job status lookup in addition to the Batch 1 foundation.
+**Batch 3 is complete.** In addition to durable submission and status lookup, the repository now contains a database-independent HTTP delivery module that sends one request and classifies its result.
 
-Outbound HTTP delivery, automatic retries, and the worker lifecycle remain planned work. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
+The worker lifecycle, retry scheduling, and database state transitions remain planned work. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
 
 ---
 
 ## Architecture
 
-The following diagram shows the target MVP architecture. Batch 2 currently implements the FastAPI submission path and PostgreSQL storage; the worker is not implemented yet.
+The following diagram shows the target MVP architecture. Batch 3 implements the FastAPI submission path, PostgreSQL storage, and one-attempt HTTP delivery logic; the worker is not implemented yet.
 
 ```text
 ┌─────────────────────┐       POST /notifications
@@ -97,7 +97,9 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 - **Implemented — durable jobs**: stores delivery state in PostgreSQL so queued work survives process restarts.
 - **Implemented — status lookup**: allows callers to inspect a job using its UUID.
 - **Implemented — duplicate-safe submission**: supports an optional `Idempotency-Key`; concurrent duplicate submissions create one row.
-- **Planned — automatic delivery and retries**: the worker, external calls, retry classification, and terminal failures are added in later batches.
+- **Implemented — single-attempt delivery**: forwards the stored request with a 10-second timeout and a stable `X-Notification-Id`.
+- **Implemented — result classification**: treats `2xx` as success; network errors, `408`, `429`, and `5xx` as retryable; and other responses as permanent failures.
+- **Planned — automatic processing**: the worker, retry scheduling, and terminal database state transitions are added in Batch 4.
 
 ---
 
@@ -228,7 +230,7 @@ Vendors that support idempotency can use this value to reject duplicate processi
 | HTTP `2xx` | Mark `succeeded` |
 | Network error or timeout | Retry |
 | HTTP `408`, `429`, or `5xx` | Retry |
-| Other HTTP `4xx` | Mark `dead` because the request is unlikely to succeed unchanged |
+| Redirects and other HTTP `4xx` | Mark `dead` because the request is unlikely to succeed unchanged |
 | Maximum attempts reached | Mark `dead` and retain the last error |
 
 The MVP makes at most five delivery attempts. Retries use capped exponential delays of approximately 1, 2, 4, and 8 minutes. Each outbound request has a 10-second timeout.
@@ -275,6 +277,7 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 │   ├── api.py               # Health and notification endpoints
 │   ├── config.py            # Environment-based configuration
 │   ├── database.py          # PostgreSQL session setup
+│   ├── delivery.py          # One-attempt HTTP delivery and result classification
 │   ├── models.py            # SQLAlchemy job model
 │   ├── repository.py        # Notification persistence and idempotency
 │   └── schemas.py           # Validated API request and response models

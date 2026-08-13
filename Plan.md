@@ -133,6 +133,8 @@ feat: add notification submission and status API
 
 ## Batch 3：单次 HTTP 投递
 
+**状态：已完成**
+
 **目标：把“如何发送一次请求、如何判断成功或失败”做成独立且可测试的模块。**
 
 ### 要完成的事情
