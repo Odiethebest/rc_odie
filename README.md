@@ -20,6 +20,7 @@
 - [Reliability and Failure Handling](#reliability-and-failure-handling)
 - [Data Model](#data-model)
 - [Repository Structure](#repository-structure)
+- [Implementation Plan](#implementation-plan)
 - [Function Documentation](#function-documentation)
 - [Getting Started](#getting-started)
 - [Quick Smoke Test](#quick-smoke-test)
@@ -256,9 +257,16 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 ├── docker-compose.yml       # API, worker, and PostgreSQL services
 ├── Dockerfile
 ├── pyproject.toml
+├── Plan.md                  # Ordered implementation batches and exit criteria
 ├── FUNCTIONS.md             # Plain-Chinese explanation of every function
 └── README.md
 ```
+
+---
+
+## Implementation Plan
+
+[`Plan.md`](Plan.md) divides the implementation into small, ordered batches. Each batch defines its scope, tests, completion criteria, documentation updates, and suggested commit before work moves to the next batch.
 
 ---
 
