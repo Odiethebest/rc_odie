@@ -17,9 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Reliable HTTP Notification Service"
     environment: Literal["development", "test", "production"] = "development"
-    database_url: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost:5432/notification_service"
-    )
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/notification_service"
     database_echo: bool = False
 
 

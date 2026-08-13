@@ -12,6 +12,8 @@
   - [配置：app/config.py](#app-config)
   - [数据库连接：app/database.py](#app-database)
   - [API：app/api.py](#app-api)
+  - [请求与响应模型：app/schemas.py](#app-schemas)
+  - [数据库操作：app/repository.py](#app-repository)
 - [数据库迁移函数](#数据库迁移函数)
   - [Alembic 运行入口](#migration-env)
   - [Alembic 文件模板](#migration-template)
@@ -20,6 +22,9 @@
   - [配置测试](#test-config)
   - [健康检查测试](#test-health)
   - [数据模型测试](#test-models)
+  - [请求模型测试](#test-schemas)
+  - [数据库操作测试](#test-repository)
+  - [通知 API 测试](#test-notifications-api)
 
 ## 维护规则
 
@@ -54,13 +59,18 @@
 |---|---|
 | [app/config.py](#app-config) | `get_settings()` |
 | [app/database.py](#app-database) | `get_session()`、`database_is_ready()` |
-| [app/api.py](#app-api) | `health_check()` |
+| [app/api.py](#app-api) | `health_check()`、`create_notification()`、`get_notification_status()` |
+| [app/schemas.py](#app-schemas) | `normalize_method()`、`validate_headers()` |
+| [app/repository.py](#app-repository) | `request_matches_job()`、`get_notification()`、`get_notification_by_idempotency_key()`、`resolve_existing_notification()`、`create_notification()` |
 | [migrations/env.py](#migration-env) | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
 | [migrations/script.py.mako](#migration-template) | `upgrade()`、`downgrade()` migration 模板 |
 | [migrations/versions/0001_create_notification_jobs.py](#migration-0001) | `upgrade()`、`downgrade()` |
 | [tests/test_config.py](#test-config) | `test_settings_reads_environment_variables()` |
 | [tests/test_health.py](#test-health) | `test_health_returns_ok_when_database_is_ready()`、`test_health_returns_503_when_database_is_unavailable()` |
 | [tests/test_models.py](#test-models) | `test_notification_job_table_contains_required_fields()`、`test_notification_status_values_are_stable()` |
+| [tests/test_schemas.py](#test-schemas) | `test_notification_create_normalizes_method_and_url()`、`test_notification_create_rejects_invalid_input()` |
+| [tests/test_repository.py](#test-repository) | `make_job()`、`test_request_matches_job_compares_outbound_content()`、`test_resolve_existing_notification_rejects_different_request()`、`test_create_notification_commits_before_returning()` |
+| [tests/test_notifications_api.py](#test-notifications-api) | `override_session()`、`make_job()`、8 个通知 API 测试函数 |
 
 ## 主要类和数据结构
 
@@ -73,6 +83,12 @@
 | `Base` | `app/models.py` | 汇总 SQLAlchemy 表结构，供 migration 使用 |
 | `NotificationJob` | `app/models.py` | 表示数据库中的一条通知任务 |
 | `HealthResponse` | `app/api.py` | 约束健康检查成功时的 JSON 格式 |
+| `HTTPMethod` | `app/schemas.py` | 定义 MVP 允许使用的四种 HTTP 方法 |
+| `NotificationCreate` | `app/schemas.py` | 校验创建通知时传入的 URL、方法、Header 和 Body |
+| `NotificationAccepted` | `app/schemas.py` | 约束任务被接收后的简短响应 |
+| `NotificationStatusResponse` | `app/schemas.py` | 约束查询任务状态时的完整响应 |
+| `IdempotencyConflictError` | `app/repository.py` | 表示同一个幂等 key 被用于不同请求 |
+| `CreateNotificationResult` | `app/repository.py` | 同时返回任务和“是否为本次新建”的结果 |
 
 ---
 
@@ -129,6 +145,99 @@
 - **主要过程**：调用 `database_is_ready()`，根据结果生成 HTTP 响应。
 - **失败情况**：数据库不可用时返回 HTTP `503` 和 `Database unavailable`。
 - **副作用**：通过 `database_is_ready()` 查询一次数据库。
+
+#### `create_notification(request, response, session, idempotency_key)`
+
+- **用途**：实现 `POST /notifications`，把一个合法通知可靠地写入数据库。
+- **输入**：已校验的通知内容、HTTP 响应对象、数据库 session，以及可选的 `Idempotency-Key`。
+- **返回**：任务 UUID 和初始状态 `pending`，HTTP 状态码为 `202`。
+- **主要过程**：清理幂等 key，调用 repository 完成写入，再把数据库对象转换成响应。
+- **失败情况**：空白 key 返回 `422`；同 key 不同请求返回 `409`；数据库提交失败时错误继续向上抛出，绝不会返回 `202`。
+- **副作用**：可能在 PostgreSQL 中新增一条通知任务；重复请求不会新增。
+
+#### `get_notification_status(notification_id, session)`
+
+- **用途**：实现 `GET /notifications/{id}`，查询一条任务目前的状态。
+- **输入**：URL 中的通知 UUID 和数据库 session。
+- **返回**：任务状态、尝试次数、下次执行时间、最近错误和时间戳。
+- **主要过程**：按主键查询任务，找到后转换成标准响应。
+- **失败情况**：UUID 格式错误时 FastAPI 返回 `422`；数据库中不存在时返回 `404`。
+- **副作用**：只读查询 PostgreSQL，不修改任务。
+
+---
+
+<a id="app-schemas"></a>
+
+### 请求与响应模型：`app/schemas.py`
+
+#### `normalize_method(cls, value)`
+
+- **用途**：让调用方可以写 `post` 或 `POST`，内部统一保存为大写。
+- **输入**：尚未完成校验的 method 值。
+- **返回**：字符串会转成大写，其他类型原样交给后续校验。
+- **主要过程**：在 `HTTPMethod` 枚举校验前做一次简单标准化。
+- **失败情况**：不在允许列表中的值随后由 Pydantic 拒绝。
+- **副作用**：无。
+
+#### `validate_headers(cls, headers)`
+
+- **用途**：防止非法 Header 名称和换行注入。
+- **输入**：Header 名称和值组成的字典。
+- **返回**：校验通过后的原字典。
+- **主要过程**：逐项检查名称格式，并确认值中没有回车或换行符。
+- **失败情况**：发现非法名称或值时抛出 Pydantic 可转换的校验错误，API 返回 `422`。
+- **副作用**：无。
+
+---
+
+<a id="app-repository"></a>
+
+### 数据库操作：`app/repository.py`
+
+#### `request_matches_job(job, request)`
+
+- **用途**：判断新请求和数据库中的旧任务是否代表完全相同的外部调用。
+- **输入**：一个已有任务和一个创建请求。
+- **返回**：URL、方法、Header、Body 全部相同时返回 `True`，否则返回 `False`。
+- **主要过程**：对四个会影响外部请求的字段逐项比较。
+- **失败情况**：无；只做内存比较。
+- **副作用**：无。
+
+#### `get_notification(session, notification_id)`
+
+- **用途**：根据公开 UUID 读取一条通知任务。
+- **输入**：数据库 session 和任务 UUID。
+- **返回**：找到时返回 `NotificationJob`，否则返回 `None`。
+- **主要过程**：使用 SQLAlchemy 主键查询。
+- **失败情况**：数据库连接或查询失败时向上抛出数据库错误。
+- **副作用**：只读查询 PostgreSQL。
+
+#### `get_notification_by_idempotency_key(session, idempotency_key)`
+
+- **用途**：查找某个幂等 key 之前创建的任务。
+- **输入**：数据库 session 和已经清理过的幂等 key。
+- **返回**：已有任务或 `None`。
+- **主要过程**：对唯一的 `idempotency_key` 字段执行查询。
+- **失败情况**：数据库查询失败时向上抛错。
+- **副作用**：只读查询 PostgreSQL。
+
+#### `resolve_existing_notification(session, idempotency_key, request)`
+
+- **用途**：统一处理“这个 key 是否已经使用过”的判断。
+- **输入**：数据库 session、幂等 key 和本次请求。
+- **返回**：没有旧任务时返回 `None`；相同请求时返回原任务。
+- **主要过程**：按 key 查询旧任务，再调用 `request_matches_job()` 比较内容。
+- **失败情况**：同一个 key 对应不同内容时抛出 `IdempotencyConflictError`。
+- **副作用**：只读查询 PostgreSQL。
+
+#### `create_notification(session, request, idempotency_key)`
+
+- **用途**：在事务成功提交后返回新任务，或返回相同幂等请求的原任务。
+- **输入**：数据库 session、已校验请求和可选幂等 key。
+- **返回**：`CreateNotificationResult`，包含任务以及本次是否真正新建。
+- **主要过程**：先检查旧 key；需要新建时加入 session、提交并刷新数据库默认值。
+- **失败情况**：唯一约束竞争时先回滚，再读取并比较胜出的任务；其他数据库错误继续向上抛出。
+- **副作用**：可能新增并提交一条 PostgreSQL 记录，也可能因重复请求只读取旧记录。
 
 ---
 
@@ -288,3 +397,165 @@
 - **主要过程**：收集 `NotificationStatus` 的所有值并与固定集合比较。
 - **失败情况**：状态缺失、多出或拼写改变时测试失败。
 - **副作用**：无。
+
+---
+
+<a id="test-schemas"></a>
+
+### 请求模型测试：`tests/test_schemas.py`
+
+#### `test_notification_create_normalizes_method_and_url()`
+
+- **用途**：确认合法请求会被整理成一致的内部格式。
+- **输入**：无；测试内构造小写 `post` 请求。
+- **返回**：无。
+- **主要过程**：创建模型并核对 method 和 URL。
+- **失败情况**：没有转成 `POST` 或 URL 被错误修改时测试失败。
+- **副作用**：无。
+
+#### `test_notification_create_rejects_invalid_input(field, value)`
+
+- **用途**：确认错误 URL、方法、Header 和 Body 都会被拒绝。
+- **输入**：pytest 依次提供五组字段和值。
+- **返回**：无。
+- **主要过程**：把错误值放入正常请求，并期待 `ValidationError`。
+- **失败情况**：任一非法输入被错误接受时测试失败。
+- **副作用**：无。
+
+---
+
+<a id="test-repository"></a>
+
+### 数据库操作测试：`tests/test_repository.py`
+
+#### `make_job(**overrides)`
+
+- **用途**：为 repository 测试快速创建字段完整的内存任务。
+- **输入**：需要覆盖的任意任务字段。
+- **返回**：一个未写入数据库的 `NotificationJob`。
+- **主要过程**：先填入正常默认值，再应用测试指定的覆盖值。
+- **失败情况**：传入不存在的字段时 SQLAlchemy 构造函数会报错。
+- **副作用**：无。
+
+#### `test_request_matches_job_compares_outbound_content()`
+
+- **用途**：确认幂等比较会检查所有外部请求内容。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：先比较完全相同的请求，再改变 Body 比较一次。
+- **失败情况**：相同请求不匹配或不同请求被当成相同时测试失败。
+- **副作用**：无。
+
+#### `test_resolve_existing_notification_rejects_different_request(monkeypatch)`
+
+- **用途**：确认同 key 不同内容会产生幂等冲突。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟数据库返回内容不同的旧任务，并期待冲突异常。
+- **失败情况**：没有抛出 `IdempotencyConflictError` 时测试失败。
+- **副作用**：不访问真实数据库。
+
+#### `test_create_notification_commits_before_returning(monkeypatch)`
+
+- **用途**：确认新任务必须完成 commit 和 refresh 才返回。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：使用 mock session 创建任务，检查 add、commit、refresh 的调用。
+- **失败情况**：漏掉任一持久化步骤时测试失败。
+- **副作用**：不访问真实数据库。
+
+---
+
+<a id="test-notifications-api"></a>
+
+### 通知 API 测试：`tests/test_notifications_api.py`
+
+#### `override_session()`
+
+- **用途**：API 单元测试 mock repository 时提供假的数据库依赖。
+- **输入**：无。
+- **返回**：异步产生一个占位对象。
+- **主要过程**：替代 FastAPI 的 `get_session()`。
+- **失败情况**：若未正确覆盖依赖，测试可能错误连接真实数据库。
+- **副作用**：无。
+
+#### `make_job()`
+
+- **用途**：为 API 响应测试创建一条字段完整的 pending 任务。
+- **输入**：无。
+- **返回**：一个内存中的 `NotificationJob`。
+- **主要过程**：生成 UUID、当前时间和所有响应必需字段。
+- **失败情况**：模型字段变化但 helper 未更新时相关测试失败。
+- **副作用**：无。
+
+#### `test_create_notification_returns_202_after_storage(monkeypatch)`
+
+- **用途**：确认成功保存后 API 返回 `202`、UUID 和 `pending`。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟 repository 成功，提交完整 HTTP 请求并检查响应。
+- **失败情况**：状态码、响应或传给 repository 的 key 不正确时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_create_notification_marks_idempotent_replay(monkeypatch)`
+
+- **用途**：确认重复请求返回原任务并带有 replay Header。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟 `created=False`，检查 ID 和 `Idempotent-Replayed`。
+- **失败情况**：API 新建 ID 或漏加 Header 时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_create_notification_returns_409_for_key_conflict(monkeypatch)`
+
+- **用途**：确认 repository 的幂等冲突会转换成清楚的 HTTP `409`。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟冲突异常并检查错误响应。
+- **失败情况**：状态码或错误文字不符合约定时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_create_notification_does_not_accept_database_failure(monkeypatch)`
+
+- **用途**：确认数据库写入失败时绝不会返回 `202`。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟未处理的数据库故障并让测试客户端查看 HTTP `500`。
+- **失败情况**：API 错误确认任务已接收时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_create_notification_returns_422_for_invalid_request()`
+
+- **用途**：确认非法 URL 和 method 在写数据库前被拒绝。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：发送带 FTP URL 和 TRACE method 的请求，检查两个字段错误。
+- **失败情况**：状态码不是 `422` 或错误字段不完整时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_get_notification_status_returns_job(monkeypatch)`
+
+- **用途**：确认已知 UUID 可以返回数据库中的任务状态。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟找到任务，调用查询接口并核对 ID 与次数。
+- **失败情况**：响应内容和任务不一致时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_get_notification_status_returns_404(monkeypatch)`
+
+- **用途**：确认不存在的 UUID 返回 HTTP `404`。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：模拟查询结果为 `None` 并检查错误响应。
+- **失败情况**：状态码或错误文字不正确时测试失败。
+- **副作用**：不访问真实数据库或网络。
+
+#### `test_notification_routes_appear_in_openapi()`
+
+- **用途**：确认两个通知接口都出现在自动生成的 API 文档中。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：读取 `/openapi.json`，检查 POST 创建和 GET 查询路径。
+- **失败情况**：路由没有注册或 HTTP 方法错误时测试失败。
+- **副作用**：不访问真实数据库或外部网络。

@@ -91,6 +91,8 @@ feat: add application and database foundation
 
 ## Batch 2：创建与查询通知任务
 
+**状态：已完成**
+
 **目标：完成业务系统与通知服务之间的最小 API 闭环。**
 
 ### 要完成的事情

@@ -15,7 +15,7 @@
 - [Overview](#overview)
 - [Implementation Status](#implementation-status)
 - [Architecture](#architecture)
-- [Target MVP Capabilities](#target-mvp-capabilities)
+- [Core Capabilities](#core-capabilities)
 - [API](#api)
 - [Job Lifecycle](#job-lifecycle)
 - [Reliability and Failure Handling](#reliability-and-failure-handling)
@@ -46,15 +46,15 @@ This project moves that responsibility into one small internal service. A busine
 
 ## Implementation Status
 
-**Batch 1 is complete.** The repository currently includes the FastAPI application skeleton, environment-based configuration, the PostgreSQL job model, an Alembic migration, a database-backed health check, and unit tests.
+**Batch 2 is complete.** The repository currently accepts validated notification jobs, stores them durably in PostgreSQL, handles duplicate-safe submission, and exposes job status lookup in addition to the Batch 1 foundation.
 
-Notification submission, status lookup, outbound delivery, and the worker lifecycle are target behavior documented below. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
+Outbound HTTP delivery, automatic retries, and the worker lifecycle remain planned work. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
 
 ---
 
 ## Architecture
 
-The following diagram shows the target MVP architecture. Batch 1 currently implements the FastAPI, PostgreSQL schema, and health-check foundation.
+The following diagram shows the target MVP architecture. Batch 2 currently implements the FastAPI submission path and PostgreSQL storage; the worker is not implemented yet.
 
 ```text
 ┌─────────────────────┐       POST /notifications
@@ -90,16 +90,14 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 
 ---
 
-## Target MVP Capabilities
+## Core Capabilities
 
-- **Asynchronous submission**: returns `202 Accepted` after a job is stored instead of waiting for the external API.
-- **Flexible requests**: accepts a target URL, an allow-listed HTTP method, headers, and a JSON body.
-- **Durable jobs**: stores delivery state in PostgreSQL so queued work survives process restarts.
-- **Automatic retries**: retries network errors, timeouts, rate limits, and server-side failures.
-- **Terminal failure tracking**: preserves the final error when a job exhausts its attempts.
-- **Status lookup**: allows callers to inspect a job using its ID.
-- **Duplicate-safe submission**: supports an optional `Idempotency-Key` so a caller can safely retry job creation.
-- **Safe concurrent workers**: uses PostgreSQL row locking to prevent two workers from claiming the same job at the same time.
+- **Implemented — asynchronous submission**: returns `202 Accepted` only after a job is stored.
+- **Implemented — flexible requests**: accepts an HTTP(S) URL, `POST`, `PUT`, `PATCH`, or `DELETE`, up to 50 headers, and an optional JSON object body.
+- **Implemented — durable jobs**: stores delivery state in PostgreSQL so queued work survives process restarts.
+- **Implemented — status lookup**: allows callers to inspect a job using its UUID.
+- **Implemented — duplicate-safe submission**: supports an optional `Idempotency-Key`; concurrent duplicate submissions create one row.
+- **Planned — automatic delivery and retries**: the worker, external calls, retry classification, and terminal failures are added in later batches.
 
 ---
 
@@ -122,7 +120,7 @@ The endpoint verifies that the API can execute a simple PostgreSQL query.
 
 It returns `503 Service Unavailable` when the database cannot be reached.
 
-### Create a Notification — Planned for Batch 2
+### Create a Notification — Implemented
 
 ```http
 POST /notifications
@@ -158,7 +156,9 @@ HTTP/1.1 202 Accepted
 
 `Idempotency-Key` is optional. If the same key and payload are submitted again, the API returns the original job instead of creating another one. Reusing a key with a different payload returns `409 Conflict`.
 
-### Get Notification Status — Planned for Batch 2
+The accepted methods are `POST`, `PUT`, `PATCH`, and `DELETE`. Invalid URLs, methods, Header syntax, or non-object JSON bodies return `422 Unprocessable Content`. An idempotent replay includes `Idempotent-Replayed: true` in the response headers.
+
+### Get Notification Status — Implemented
 
 ```http
 GET /notifications/f183bf31-53d5-42db-aeb7-42a7bfa48dc2
@@ -169,13 +169,13 @@ Example response:
 ```json
 {
   "id": "f183bf31-53d5-42db-aeb7-42a7bfa48dc2",
-  "status": "retrying",
-  "attempt_count": 2,
-  "next_attempt_at": "2026-08-12T20:30:00Z",
-  "last_status_code": 503,
-  "last_error": "External API returned HTTP 503",
+  "status": "pending",
+  "attempt_count": 0,
+  "next_attempt_at": "2026-08-12T20:20:00Z",
+  "last_status_code": null,
+  "last_error": null,
   "created_at": "2026-08-12T20:20:00Z",
-  "updated_at": "2026-08-12T20:25:00Z"
+  "updated_at": "2026-08-12T20:20:00Z"
 }
 ```
 
@@ -249,7 +249,7 @@ The MVP uses one main PostgreSQL table:
 |---|---|
 | `id` | Stable UUID for tracking and downstream idempotency |
 | `idempotency_key` | Optional unique key for duplicate-safe submission |
-| `target_url` | Destination HTTPS URL |
+| `target_url` | Destination HTTP(S) URL |
 | `method` | Allow-listed HTTP method |
 | `headers` | Request headers stored as `JSONB` |
 | `body` | JSON request body stored as `JSONB` |
@@ -272,13 +272,15 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI application entry point
-│   ├── api.py               # Health endpoint
+│   ├── api.py               # Health and notification endpoints
 │   ├── config.py            # Environment-based configuration
 │   ├── database.py          # PostgreSQL session setup
 │   ├── models.py            # SQLAlchemy job model
+│   ├── repository.py        # Notification persistence and idempotency
+│   └── schemas.py           # Validated API request and response models
 ├── migrations/
 │   └── versions/            # Alembic database revisions
-├── tests/                   # Configuration, health, and model tests
+├── tests/                   # Configuration, model, repository, and API tests
 ├── .env.example             # Local configuration template
 ├── alembic.ini              # Migration configuration
 ├── docker-compose.yml       # PostgreSQL service for local development
@@ -327,7 +329,7 @@ source .venv/bin/activate
 
 The `.venv` directory is local-only and is excluded from Git.
 
-### Run the Batch 1 Foundation
+### Run the Current Application
 
 Clone the repository and create the local environment file:
 
@@ -372,7 +374,7 @@ uv run pytest
 
 ## Quick Smoke Test
 
-With PostgreSQL and the API running, check the current Batch 1 endpoint:
+With PostgreSQL and the API running, first check service health:
 
 ```bash
 curl -i http://localhost:8000/health
@@ -387,7 +389,27 @@ Expected body:
 }
 ```
 
-The notification creation and delivery smoke test will be added when those batches are implemented.
+Create a durable pending notification:
+
+```bash
+curl -i -X POST http://localhost:8000/notifications \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: smoke-test-1' \
+  -d '{
+    "target_url": "https://vendor.example/callback",
+    "method": "POST",
+    "headers": {},
+    "body": {"event": "payment.succeeded"}
+  }'
+```
+
+Copy the returned `id` and query the stored state:
+
+```bash
+curl http://localhost:8000/notifications/<notification-id>
+```
+
+The status remains `pending` until the delivery worker is implemented in Batch 4.
 
 ---
 
