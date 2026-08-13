@@ -56,32 +56,14 @@ The implementation order and completed exit criteria are recorded in [`Plan.md`]
 
 The following diagram shows the implemented MVP architecture. The API and Worker run as separate processes against the same PostgreSQL database.
 
-```text
-┌─────────────────────┐       POST /notifications
-│  Business Systems   │ ───────────────────────────────────┐
-└─────────────────────┘                                    │
-                                                           ▼
-                                             ┌────────────────────────┐
-                                             │      FastAPI API       │
-                                             │ Validate and store job │
-                                             └────────────┬───────────┘
-                                                          │
-                                                          ▼
-                                             ┌────────────────────────┐
-                                             │       PostgreSQL       │
-                                             │ Jobs, status, retries  │
-                                             └────────────┬───────────┘
-                                                          │ claim due jobs
-                                                          ▼
-                                             ┌────────────────────────┐
-                                             │   Delivery Worker      │
-                                             │ Send, retry, finalize  │
-                                             └────────────┬───────────┘
-                                                          │ HTTP(S)
-                                                          ▼
-                                             ┌────────────────────────┐
-                                             │  External Vendor APIs  │
-                                             └────────────────────────┘
+```mermaid
+flowchart LR
+    Caller[Business Systems] -->|1. Submit notification| API[FastAPI API]
+    API -->|2. Commit job| DB[(PostgreSQL)]
+    API -.->|3. Return 202 after commit| Caller
+    DB -->|4. Claim due jobs| Worker[Delivery Worker]
+    Worker -->|5. Send HTTP request| Vendor[Vendor APIs]
+    Worker -->|6. Update status or retry| DB
 ```
 
 The API and worker are separate processes built from the same codebase. PostgreSQL is both the durable system of record and the lightweight job queue.
