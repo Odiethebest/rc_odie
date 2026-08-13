@@ -297,6 +297,7 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 ├── docker-compose.yml       # Complete local service orchestration
 ├── Dockerfile               # Locked Python 3.11 application image
 ├── pyproject.toml
+├── AI_USAGE.md              # Detailed disclosure of AI assistance and human review
 ├── Plan.md                  # Ordered implementation batches and exit criteria
 ├── FUNCTIONS.md             # Plain-Chinese explanation of every function
 └── README.md
@@ -538,27 +539,6 @@ This path preserves the simple API contract while allowing the delivery implemen
 
 ## AI Use Disclosure
 
-AI was used as an engineering assistant throughout requirement analysis, implementation, testing, container setup, and documentation. Its output was treated as a draft: the author reviewed the code, corrected inconsistencies, and ran the automated and real Docker workflows before accepting it.
+AI assisted with requirement analysis, implementation, testing, container setup, and documentation. Its output was reviewed and corrected rather than accepted automatically, and AI is not part of the runtime system.
 
-### Where AI Helped
-
-- summarized the assignment into an API, durable job store, and background delivery flow
-- compared PostgreSQL-based job claiming with dedicated queue technologies
-- identified failure cases such as timeouts, ambiguous delivery outcomes, duplicate requests, and worker crashes
-- drafted implementation scaffolding, unit tests, Docker configuration, and documentation that the author then reviewed and revised
-- helped audit the final repository for mismatches between documented behavior and executable code
-
-### Suggestions Not Adopted
-
-- **Redis and Celery** were not adopted because PostgreSQL already provides the durability and locking needed for this MVP.
-- **Kafka or RabbitMQ** were not adopted because the assignment provides no throughput requirement that justifies another distributed system.
-- **Exactly-once delivery** was not claimed because ordinary HTTP calls cannot provide that guarantee without cooperation from the receiving vendor.
-- **Vendor-specific adapters, a dashboard, and multi-region deployment** were deferred because they increase complexity without proving the core delivery path.
-
-### Human Decisions
-
-The author chose FastAPI and PostgreSQL and required the design to remain simple enough to explain function by function. The author approved PostgreSQL row locking as the first-version queue because the assignment gives no scale requirement that justifies operating another data system. The author also chose at-least-once delivery, five bounded attempts, and visible `dead` jobs because these rules are honest about ambiguous HTTP failures and prevent an unavailable vendor from growing the queue forever.
-
-The author kept authentication, SSRF controls, secret-manager integration, alerting, and manual replay outside the demo only after documenting why they are required before production use. These decisions, along with the tests and end-to-end results, were reviewed against the original assignment rather than accepted solely because AI suggested them.
-
-AI-generated suggestions and text were reviewed and may be revised during implementation so that this document remains consistent with the actual code.
+See [`AI_USAGE.md`](AI_USAGE.md) for the complete disclosure, including suggestions that were not adopted, AI output that required correction, decisions made by the author, and final verification evidence.
