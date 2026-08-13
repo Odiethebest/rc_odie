@@ -17,6 +17,7 @@
   - [HTTP 投递：app/delivery.py](#app-delivery)
   - [Worker 数据库状态：app/worker_repository.py](#app-worker-repository)
   - [Worker 循环：app/worker.py](#app-worker)
+  - [本地 Mock Vendor：app/mock_vendor.py](#app-mock-vendor)
 - [数据库迁移函数](#数据库迁移函数)
   - [Alembic 运行入口](#migration-env)
   - [Alembic 文件模板](#migration-template)
@@ -31,6 +32,7 @@
   - [HTTP 投递测试](#test-delivery)
   - [Worker 数据库测试](#test-worker-repository)
   - [Worker 循环测试](#test-worker)
+  - [Mock Vendor 测试](#test-mock-vendor)
 
 ## 维护规则
 
@@ -71,6 +73,7 @@
 | [app/delivery.py](#app-delivery) | `classify_status_code()`、`build_outbound_headers()`、`bound_error_message()`、`deliver_notification()` |
 | [app/worker_repository.py](#app-worker-repository) | `retry_delay()`、`claim_due_notifications()`、`record_delivery_result()`、`recover_stale_notifications()` |
 | [app/worker.py](#app-worker) | `process_claimed_notification()`、`run_worker_cycle()`、`wait_for_next_cycle()`、`worker_loop()`、`request_shutdown()`、`install_signal_handlers()`、`run_worker()`、`main()` |
+| [app/mock_vendor.py](#app-mock-vendor) | `remember_request()`、`health_check()`、`accept_notification()`、`reject_temporarily()`、`reject_permanently()`、`get_received_notification()` |
 | [migrations/env.py](#migration-env) | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
 | [migrations/script.py.mako](#migration-template) | `upgrade()`、`downgrade()` migration 模板 |
 | [migrations/versions/0001_create_notification_jobs.py](#migration-0001) | `upgrade()`、`downgrade()` |
@@ -83,6 +86,7 @@
 | [tests/test_delivery.py](#test-delivery) | `make_job()`、9 个投递测试函数 |
 | [tests/test_worker_repository.py](#test-worker-repository) | 2 个 helper 和 5 个 Worker 数据库测试函数 |
 | [tests/test_worker.py](#test-worker) | 4 个 helper、10 个嵌套 helper 和 7 个 Worker 循环测试函数 |
+| [tests/test_mock_vendor.py](#test-mock-vendor) | 1 个清理 fixture 和 5 个 Mock Vendor 测试函数 |
 
 ## 主要类和数据结构
 
@@ -415,6 +419,68 @@
 - **主要过程**：配置基本日志，再通过 `asyncio.run()` 启动 Worker。
 - **失败情况**：Worker 错误会使命令以失败状态退出。
 - **副作用**：启动长期运行的 Worker 进程。
+
+---
+
+<a id="app-mock-vendor"></a>
+
+### 本地 Mock Vendor：`app/mock_vendor.py`
+
+这个文件只用于本地 Docker 演示，不属于生产通知服务接口。
+
+#### `remember_request(request)`
+
+- **用途**：记录 mock vendor 收到的安全请求信息，供 Smoke Test 查询。
+- **输入**：FastAPI `Request`。
+- **返回**：请求中的 `X-Notification-Id`。
+- **主要过程**：检查通知 ID，解析 JSON Body，只保存 ID、方法和 Body。
+- **失败情况**：缺少通知 ID 返回 `400`；非 JSON Body 用固定占位文字表示。
+- **副作用**：写入 mock 进程内存；不会记录 Authorization 等 Header。
+
+#### `health_check()`
+
+- **用途**：供 Docker Compose 判断 mock vendor 是否可以接收请求。
+- **输入**：无。
+- **返回**：`{"status": "ok"}`。
+- **主要过程**：直接返回固定结果。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `accept_notification(request)`
+
+- **用途**：模拟供应商成功处理通知。
+- **输入**：POST、PUT、PATCH 或 DELETE 请求。
+- **返回**：HTTP `204` 空响应。
+- **主要过程**：先记录安全请求信息，再返回成功。
+- **失败情况**：缺少通知 ID 时由 `remember_request()` 返回 `400`。
+- **副作用**：把安全请求信息写入 mock 进程内存。
+
+#### `reject_temporarily(request)`
+
+- **用途**：模拟供应商暂时不可用。
+- **输入**：支持的 HTTP 通知请求。
+- **返回**：HTTP `503`。
+- **主要过程**：记录请求，再返回固定临时故障。
+- **失败情况**：缺少通知 ID 时返回 `400`。
+- **副作用**：把安全请求信息写入 mock 进程内存。
+
+#### `reject_permanently(request)`
+
+- **用途**：模拟供应商永久拒绝当前请求。
+- **输入**：支持的 HTTP 通知请求。
+- **返回**：HTTP `400`。
+- **主要过程**：记录请求，再返回固定永久错误。
+- **失败情况**：缺少通知 ID 时同样返回 `400`。
+- **副作用**：把安全请求信息写入 mock 进程内存。
+
+#### `get_received_notification(notification_id)`
+
+- **用途**：让 Smoke Test 确认指定通知确实到达 mock vendor。
+- **输入**：通知 ID 字符串。
+- **返回**：之前记录的 ID、HTTP 方法和 Body。
+- **主要过程**：从进程内存按 ID 查找。
+- **失败情况**：没有收到该 ID 时返回 `404`。
+- **副作用**：无，只读取进程内存。
 
 ---
 
@@ -1096,3 +1162,63 @@
 - **主要过程**：清除 `locked_at` 并期待 `ValueError`。
 - **失败情况**：函数继续发送任务时测试失败。
 - **副作用**：不访问数据库或网络。
+
+---
+
+<a id="test-mock-vendor"></a>
+
+### Mock Vendor 测试：`tests/test_mock_vendor.py`
+
+#### `clear_received_requests()`
+
+- **用途**：防止不同 mock vendor 测试共享内存记录。
+- **输入**：无；pytest 自动在每个测试前调用。
+- **返回**：无。
+- **主要过程**：清空 `received_requests`。
+- **失败情况**：无。
+- **副作用**：删除测试进程中的 mock 请求记录。
+
+#### `test_mock_vendor_health_check()`
+
+- **用途**：验证容器健康接口返回可用状态。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：通过内存 ASGI client 请求 `/health`。
+- **失败情况**：状态码或 JSON 不正确时测试失败。
+- **副作用**：不访问真实网络。
+
+#### `test_success_endpoint_records_safe_request_details(method)`
+
+- **用途**：验证四种 HTTP 方法都成功，并且只记录安全字段。
+- **输入**：pytest 提供的 POST、PUT、PATCH、DELETE。
+- **返回**：无。
+- **主要过程**：发送带 Body 和 Authorization 的请求，再查询 inspection 接口。
+- **失败情况**：不是 `204`、内容不一致或 Authorization 泄露时测试失败。
+- **副作用**：写入并读取测试进程内存。
+
+#### `test_failure_endpoints_return_expected_status(path, expected_status)`
+
+- **用途**：验证临时和永久故障端点分别返回 `503` 与 `400`。
+- **输入**：pytest 提供的路径和期望状态码。
+- **返回**：无。
+- **主要过程**：提交通知并确认状态与接收记录。
+- **失败情况**：状态码错误或没有记录通知时测试失败。
+- **副作用**：写入测试进程内存。
+
+#### `test_mock_vendor_requires_notification_id()`
+
+- **用途**：验证绕过通知服务、缺少通知 ID 的请求会被拒绝。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：不带 ID 请求成功端点并检查 `400`。
+- **失败情况**：请求被错误接受或错误信息变化时测试失败。
+- **副作用**：不访问真实网络。
+
+#### `test_inspection_returns_404_for_unknown_notification()`
+
+- **用途**：验证查询未收到的通知会返回 `404`。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：查询固定未知 ID 并检查响应。
+- **失败情况**：状态码或错误信息不正确时测试失败。
+- **副作用**：不访问真实网络。

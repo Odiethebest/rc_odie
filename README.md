@@ -46,9 +46,9 @@ This project moves that responsibility into one small internal service. A busine
 
 ## Implementation Status
 
-**Batch 4 is complete.** The service now provides the full MVP delivery lifecycle: durable submission, safe database claiming, outbound HTTP delivery, bounded retries, terminal failures, crash recovery, and status lookup.
+**Batch 5 is complete.** The full MVP delivery lifecycle is implemented and packaged as a reproducible Docker Compose environment with PostgreSQL, automatic migrations, the API, the Worker, and an offline mock vendor.
 
-Container packaging and a local mock vendor remain planned for Batch 5. The implementation order and exit criteria are defined in [`Plan.md`](Plan.md).
+The remaining Batch 6 work is a final consistency, security, and submission audit. The implementation order and exit criteria are defined in [`Plan.md`](Plan.md).
 
 ---
 
@@ -103,6 +103,7 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 - **Retry lifecycle**: schedules retryable failures after approximately 1, 2, 4, and 8 minutes, with at most five started attempts.
 - **Crash recovery**: expired `processing` leases return to `retrying`, or become `dead` after the final attempt.
 - **Graceful shutdown**: SIGINT and SIGTERM stop the Worker before it claims another batch.
+- **Offline demo**: Docker Compose starts the complete service and deterministic success, retryable, and permanent-failure vendor endpoints.
 
 ---
 
@@ -277,6 +278,7 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI application entry point
+│   ├── mock_vendor.py       # Local-only vendor used by the offline smoke test
 │   ├── api.py               # Health and notification endpoints
 │   ├── config.py            # Environment-based configuration
 │   ├── database.py          # PostgreSQL session setup
@@ -290,8 +292,10 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 │   └── versions/            # Alembic database revisions
 ├── tests/                   # Configuration, model, repository, and API tests
 ├── .env.example             # Local configuration template
+├── .dockerignore            # Small and secret-free Docker build context
 ├── alembic.ini              # Migration configuration
-├── docker-compose.yml       # PostgreSQL service for local development
+├── docker-compose.yml       # Complete local service orchestration
+├── Dockerfile               # Locked Python 3.11 application image
 ├── pyproject.toml
 ├── Plan.md                  # Ordered implementation batches and exit criteria
 ├── FUNCTIONS.md             # Plain-Chinese explanation of every function
@@ -319,7 +323,44 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 - Docker with Docker Compose, or
 - Python 3.11+, [uv](https://docs.astral.sh/uv/), and PostgreSQL 15+
 
-### Local Python Environment
+### Run with Docker Compose
+
+Clone the repository and create the local environment file:
+
+```bash
+git clone <your-repo-url>
+cd rc_<your_nickname>
+cp .env.example .env
+```
+
+Build and start PostgreSQL, migrations, the API, the Worker, and the mock vendor:
+
+```bash
+docker compose up --build -d
+```
+
+The `migrate` service exits with code `0` after applying the latest Alembic revision. The other services then start in dependency order.
+
+View service logs when needed:
+
+```bash
+docker compose logs -f api worker
+```
+
+Default local endpoints:
+
+- API: `http://localhost:8000`
+- Interactive API documentation: `http://localhost:8000/docs`
+- Health check: `http://localhost:8000/health`
+- Mock vendor inspection: `http://localhost:9000/docs`
+
+Stop the services while preserving PostgreSQL data:
+
+```bash
+docker compose down
+```
+
+### Run Directly with uv
 
 The project pins Python 3.11 in `.python-version` and uses `uv.lock` for reproducible dependencies.
 
@@ -335,17 +376,7 @@ Activate it when you want to run commands directly:
 source .venv/bin/activate
 ```
 
-The `.venv` directory is local-only and is excluded from Git.
-
-### Run the Current Application
-
-Clone the repository and create the local environment file:
-
-```bash
-git clone <your-repo-url>
-cd rc_<your_nickname>
-cp .env.example .env
-```
+The `.venv` directory is local-only and is excluded from Git. With PostgreSQL available, run migrations and start the two application processes:
 
 Start PostgreSQL:
 
@@ -370,12 +401,6 @@ In another terminal, start the Worker:
 ```bash
 uv run python -m app.worker
 ```
-
-Default local endpoints:
-
-- API: `http://localhost:8000`
-- Interactive API documentation: `http://localhost:8000/docs`
-- Health check: `http://localhost:8000/health`
 
 ### Run Tests
 
@@ -403,14 +428,14 @@ Expected body:
 }
 ```
 
-Create a durable notification. This example requires internet access; Batch 5 adds a local mock vendor for an offline smoke test.
+Create a notification addressed to the mock vendor inside the Compose network:
 
 ```bash
 curl -i -X POST http://localhost:8000/notifications \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: smoke-test-1' \
   -d '{
-    "target_url": "https://httpbin.org/status/200",
+    "target_url": "http://mock-vendor:9000/success",
     "method": "POST",
     "headers": {},
     "body": {"event": "payment.succeeded"}
@@ -423,7 +448,18 @@ Copy the returned `id` and query the stored state:
 curl http://localhost:8000/notifications/<notification-id>
 ```
 
-With the Worker running, the status should move from `pending` through `processing` to `succeeded`.
+With the Worker running, the status moves from `pending` through `processing` to `succeeded`. Confirm that the mock vendor received the same notification ID and Body:
+
+```bash
+curl http://localhost:9000/received/<notification-id>
+```
+
+To exercise failure handling, submit the same request with one of these target URLs:
+
+| Target URL | Expected status |
+|---|---|
+| `http://mock-vendor:9000/retryable` | `retrying` after HTTP `503` |
+| `http://mock-vendor:9000/permanent` | `dead` after HTTP `400` |
 
 ---
 

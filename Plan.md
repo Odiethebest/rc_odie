@@ -215,6 +215,8 @@ feat: add database worker and retry lifecycle
 
 ## Batch 5：Docker 与端到端验证
 
+**状态：已完成**
+
 **目标：让评审者可以用一条命令启动完整系统并验证主要流程。**
 
 ### 要完成的事情
