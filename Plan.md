@@ -173,6 +173,8 @@ feat: add outbound HTTP delivery
 
 ## Batch 4：Worker、重试与崩溃恢复
 
+**状态：已完成**
+
 **目标：把数据库中的任务自动投递出去，形成完整的可靠投递流程。**
 
 ### 要完成的事情

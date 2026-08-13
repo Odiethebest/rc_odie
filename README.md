@@ -46,15 +46,15 @@ This project moves that responsibility into one small internal service. A busine
 
 ## Implementation Status
 
-**Batch 3 is complete.** In addition to durable submission and status lookup, the repository now contains a database-independent HTTP delivery module that sends one request and classifies its result.
+**Batch 4 is complete.** The service now provides the full MVP delivery lifecycle: durable submission, safe database claiming, outbound HTTP delivery, bounded retries, terminal failures, crash recovery, and status lookup.
 
-The worker lifecycle, retry scheduling, and database state transitions remain planned work. They will be implemented in the ordered batches defined in [`Plan.md`](Plan.md).
+Container packaging and a local mock vendor remain planned for Batch 5. The implementation order and exit criteria are defined in [`Plan.md`](Plan.md).
 
 ---
 
 ## Architecture
 
-The following diagram shows the target MVP architecture. Batch 3 implements the FastAPI submission path, PostgreSQL storage, and one-attempt HTTP delivery logic; the worker is not implemented yet.
+The following diagram shows the implemented MVP architecture. The API and Worker run as separate processes against the same PostgreSQL database.
 
 ```text
 ┌─────────────────────┐       POST /notifications
@@ -99,7 +99,10 @@ This keeps the MVP easy to run and understand: there is no Redis, RabbitMQ, Kafk
 - **Implemented — duplicate-safe submission**: supports an optional `Idempotency-Key`; concurrent duplicate submissions create one row.
 - **Implemented — single-attempt delivery**: forwards the stored request with a 10-second timeout and a stable `X-Notification-Id`.
 - **Implemented — result classification**: treats `2xx` as success; network errors, `408`, `429`, and `5xx` as retryable; and other responses as permanent failures.
-- **Planned — automatic processing**: the worker, retry scheduling, and terminal database state transitions are added in Batch 4.
+- **Automatic processing**: a polling Worker safely claims due rows with `FOR UPDATE SKIP LOCKED`.
+- **Retry lifecycle**: schedules retryable failures after approximately 1, 2, 4, and 8 minutes, with at most five started attempts.
+- **Crash recovery**: expired `processing` leases return to `retrying`, or become `dead` after the final attempt.
+- **Graceful shutdown**: SIGINT and SIGTERM stop the Worker before it claims another batch.
 
 ---
 
@@ -203,7 +206,7 @@ pending ──▶ processing ──▶ succeeded
 | `succeeded` | The external API returned a `2xx` response |
 | `dead` | The request cannot be retried or has exhausted all attempts |
 
-A recovery check returns jobs that remain in `processing` beyond the worker lease timeout to `retrying`. This prevents a worker crash from leaving jobs permanently stuck.
+A recovery check returns jobs that remain in `processing` beyond the 60-second worker lease to `retrying`. A late result from the expired worker is ignored, preventing it from overwriting the recovered task.
 
 ---
 
@@ -256,7 +259,7 @@ The MVP uses one main PostgreSQL table:
 | `headers` | Request headers stored as `JSONB` |
 | `body` | JSON request body stored as `JSONB` |
 | `status` | Current lifecycle state |
-| `attempt_count` | Number of completed delivery attempts |
+| `attempt_count` | Number of started delivery attempts, including attempts interrupted by a worker crash |
 | `next_attempt_at` | Earliest time at which the worker may retry |
 | `locked_at` | Start time of the current worker lease |
 | `last_status_code` | Most recent external HTTP status, when available |
@@ -280,7 +283,9 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 │   ├── delivery.py          # One-attempt HTTP delivery and result classification
 │   ├── models.py            # SQLAlchemy job model
 │   ├── repository.py        # Notification persistence and idempotency
-│   └── schemas.py           # Validated API request and response models
+│   ├── schemas.py           # Validated API request and response models
+│   ├── worker.py            # Polling loop and graceful process entry point
+│   └── worker_repository.py # Claim, retry, completion, and recovery transitions
 ├── migrations/
 │   └── versions/            # Alembic database revisions
 ├── tests/                   # Configuration, model, repository, and API tests
@@ -360,6 +365,12 @@ Start the API:
 uv run uvicorn app.main:app --reload
 ```
 
+In another terminal, start the Worker:
+
+```bash
+uv run python -m app.worker
+```
+
 Default local endpoints:
 
 - API: `http://localhost:8000`
@@ -392,14 +403,14 @@ Expected body:
 }
 ```
 
-Create a durable pending notification:
+Create a durable notification. This example requires internet access; Batch 5 adds a local mock vendor for an offline smoke test.
 
 ```bash
 curl -i -X POST http://localhost:8000/notifications \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: smoke-test-1' \
   -d '{
-    "target_url": "https://vendor.example/callback",
+    "target_url": "https://httpbin.org/status/200",
     "method": "POST",
     "headers": {},
     "body": {"event": "payment.succeeded"}
@@ -412,7 +423,7 @@ Copy the returned `id` and query the stored state:
 curl http://localhost:8000/notifications/<notification-id>
 ```
 
-The status remains `pending` until the delivery worker is implemented in Batch 4.
+With the Worker running, the status should move from `pending` through `processing` to `succeeded`.
 
 ---
 

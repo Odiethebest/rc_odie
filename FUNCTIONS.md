@@ -15,6 +15,8 @@
   - [请求与响应模型：app/schemas.py](#app-schemas)
   - [数据库操作：app/repository.py](#app-repository)
   - [HTTP 投递：app/delivery.py](#app-delivery)
+  - [Worker 数据库状态：app/worker_repository.py](#app-worker-repository)
+  - [Worker 循环：app/worker.py](#app-worker)
 - [数据库迁移函数](#数据库迁移函数)
   - [Alembic 运行入口](#migration-env)
   - [Alembic 文件模板](#migration-template)
@@ -27,6 +29,8 @@
   - [数据库操作测试](#test-repository)
   - [通知 API 测试](#test-notifications-api)
   - [HTTP 投递测试](#test-delivery)
+  - [Worker 数据库测试](#test-worker-repository)
+  - [Worker 循环测试](#test-worker)
 
 ## 维护规则
 
@@ -65,6 +69,8 @@
 | [app/schemas.py](#app-schemas) | `normalize_method()`、`validate_headers()` |
 | [app/repository.py](#app-repository) | `request_matches_job()`、`get_notification()`、`get_notification_by_idempotency_key()`、`resolve_existing_notification()`、`create_notification()` |
 | [app/delivery.py](#app-delivery) | `classify_status_code()`、`build_outbound_headers()`、`bound_error_message()`、`deliver_notification()` |
+| [app/worker_repository.py](#app-worker-repository) | `retry_delay()`、`claim_due_notifications()`、`record_delivery_result()`、`recover_stale_notifications()` |
+| [app/worker.py](#app-worker) | `process_claimed_notification()`、`run_worker_cycle()`、`wait_for_next_cycle()`、`worker_loop()`、`request_shutdown()`、`install_signal_handlers()`、`run_worker()`、`main()` |
 | [migrations/env.py](#migration-env) | `run_migrations_offline()`、`do_run_migrations()`、`run_async_migrations()`、`run_migrations_online()` |
 | [migrations/script.py.mako](#migration-template) | `upgrade()`、`downgrade()` migration 模板 |
 | [migrations/versions/0001_create_notification_jobs.py](#migration-0001) | `upgrade()`、`downgrade()` |
@@ -75,6 +81,8 @@
 | [tests/test_repository.py](#test-repository) | `make_job()`、`test_request_matches_job_compares_outbound_content()`、`test_resolve_existing_notification_rejects_different_request()`、`test_create_notification_commits_before_returning()` |
 | [tests/test_notifications_api.py](#test-notifications-api) | `override_session()`、`make_job()`、8 个通知 API 测试函数 |
 | [tests/test_delivery.py](#test-delivery) | `make_job()`、9 个投递测试函数 |
+| [tests/test_worker_repository.py](#test-worker-repository) | 2 个 helper 和 5 个 Worker 数据库测试函数 |
+| [tests/test_worker.py](#test-worker) | 4 个 helper、10 个嵌套 helper 和 7 个 Worker 循环测试函数 |
 
 ## 主要类和数据结构
 
@@ -95,6 +103,7 @@
 | `CreateNotificationResult` | `app/repository.py` | 同时返回任务和“是否为本次新建”的结果 |
 | `DeliveryOutcome` | `app/delivery.py` | 定义成功、可重试失败和永久失败三种投递结果 |
 | `DeliveryResult` | `app/delivery.py` | 保存一次投递的分类、HTTP 状态码和有限长度错误信息 |
+| `FakeSessionContext` | `tests/test_worker.py` | 在 Worker 单元测试中模拟异步数据库 session 上下文 |
 
 ---
 
@@ -289,6 +298,126 @@
 
 ---
 
+<a id="app-worker-repository"></a>
+
+### Worker 数据库状态：`app/worker_repository.py`
+
+#### `retry_delay(attempt_count)`
+
+- **用途**：根据当前尝试次数计算下一次重试要等待多久。
+- **输入**：已经开始的投递次数。
+- **返回**：1、2、4 或 8 分钟的 `timedelta`，超过第四次后仍保持 8 分钟。
+- **主要过程**：把次数映射到固定退避表，并限制索引范围。
+- **失败情况**：零或负数会安全地使用第一档 1 分钟。
+- **副作用**：无。
+
+#### `claim_due_notifications(session, limit, now)`
+
+- **用途**：安全领取一批已到执行时间的任务。
+- **输入**：数据库 session、批次上限和当前时间。
+- **返回**：已经变成 `processing` 的任务列表。
+- **主要过程**：用 `FOR UPDATE SKIP LOCKED` 查询 `pending/retrying`，设置租约并增加尝试次数，然后提交事务。
+- **失败情况**：查询或提交失败时向上抛出数据库错误，不会开始网络调用。
+- **副作用**：修改任务状态、`locked_at` 和 `attempt_count` 并提交 PostgreSQL。
+
+#### `record_delivery_result(session, notification_id, locked_at, result, now)`
+
+- **用途**：把一次外部调用结果安全地写回仍由当前 Worker 持有的任务。
+- **输入**：数据库 session、任务 ID、领取时的租约时间、投递结果和当前时间。
+- **返回**：成功记录返回 `True`；租约已失效返回 `False`。
+- **主要过程**：锁定任务并核对租约；成功改为 `succeeded`，临时失败安排重试，永久失败或第五次失败改为 `dead`。
+- **失败情况**：过期 Worker 的结果会回滚并忽略；数据库错误继续抛出。
+- **副作用**：可能更新状态、下一次时间、状态码和错误信息并提交 PostgreSQL。
+
+#### `recover_stale_notifications(session, stale_before, now, limit)`
+
+- **用途**：恢复 Worker 崩溃后长期停在 `processing` 的任务。
+- **输入**：数据库 session、租约过期界线、当前时间和单次恢复上限。
+- **返回**：本次恢复的任务数量。
+- **主要过程**：锁定过期任务；未到第五次的立即改为 `retrying`，已用完次数的改为 `dead`。
+- **失败情况**：数据库错误继续抛出；并发恢复通过 `SKIP LOCKED` 避免重复处理。
+- **副作用**：清除过期租约、记录恢复原因并提交 PostgreSQL。
+
+---
+
+<a id="app-worker"></a>
+
+### Worker 循环：`app/worker.py`
+
+#### `process_claimed_notification(job, client, session_maker, clock)`
+
+- **用途**：投递一条已经完成数据库领取提交的任务，并记录结果。
+- **输入**：已领取任务、HTTP client、session factory 和时钟函数。
+- **返回**：无。
+- **主要过程**：确认租约存在，发送外部请求，再用新 session 写回结果。
+- **失败情况**：缺少租约会抛出 `ValueError`；过期结果只写警告，不覆盖新状态。
+- **副作用**：发送 HTTP 请求，并可能更新 PostgreSQL。
+
+#### `run_worker_cycle(client, session_maker, settings, clock)`
+
+- **用途**：执行一轮“恢复过期任务、领取到期任务、并发投递”。
+- **输入**：HTTP client、session factory、Worker 配置和时钟。
+- **返回**：本轮领取并处理的任务数。
+- **主要过程**：先单独提交恢复事务，再单独提交领取事务，最后并发处理本批任务；单条意外失败留给租约恢复，不影响其他任务。
+- **失败情况**：未处理异常向上抛出，使进程失败并由租约恢复保护任务。
+- **副作用**：查询和修改数据库，发送零到多次 HTTP 请求。
+
+#### `wait_for_next_cycle(stop_event, seconds)`
+
+- **用途**：等待下一轮轮询，同时允许停止信号立即唤醒 Worker。
+- **输入**：停止事件和等待秒数。
+- **返回**：无。
+- **主要过程**：等待事件，超时表示正常进入下一轮。
+- **失败情况**：正常超时会被忽略；取消等其他异常继续抛出。
+- **副作用**：暂停当前异步任务，但不阻塞事件循环。
+
+#### `worker_loop(stop_event, client, session_maker, settings, clock)`
+
+- **用途**：持续运行 Worker，直到收到停止请求。
+- **输入**：停止事件以及可替换的 HTTP、数据库、配置和时钟依赖。
+- **返回**：无。
+- **主要过程**：检查停止状态、执行一轮、等待；停止后不再领取新批次。
+- **失败情况**：一轮中的未处理异常会退出循环，已领取任务由租约机制恢复。
+- **副作用**：持续访问数据库并向供应商发送请求。
+
+#### `request_shutdown(stop_event)`
+
+- **用途**：把进程信号转换成 Worker 能识别的停止事件。
+- **输入**：Worker 使用的 `asyncio.Event`。
+- **返回**：无。
+- **主要过程**：调用事件的 `set()`。
+- **失败情况**：无。
+- **副作用**：改变内存中的停止状态。
+
+#### `install_signal_handlers(stop_event)`
+
+- **用途**：让 SIGINT 和 SIGTERM 可以触发正常停止。
+- **输入**：Worker 的停止事件。
+- **返回**：无。
+- **主要过程**：在当前事件循环中为两个进程信号注册回调。
+- **失败情况**：运行平台不支持事件循环信号处理时会抛出平台相关错误。
+- **副作用**：修改当前进程的信号处理配置。
+
+#### `run_worker()`
+
+- **用途**：创建正式 Worker 所需资源并启动循环。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：建立停止事件、安装信号、创建共享 httpx client 并运行循环。
+- **失败情况**：初始化或循环错误向上抛出，进程退出。
+- **副作用**：安装信号处理、打开 HTTP 连接池并运行 Worker。
+
+#### `main()`
+
+- **用途**：提供 `python -m app.worker` 命令行入口。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：配置基本日志，再通过 `asyncio.run()` 启动 Worker。
+- **失败情况**：Worker 错误会使命令以失败状态退出。
+- **副作用**：启动长期运行的 Worker 进程。
+
+---
+
 ## 数据库迁移函数
 
 <a id="migration-env"></a>
@@ -394,7 +523,7 @@
 - **用途**：确认环境变量可以覆盖开发环境默认配置。
 - **输入**：pytest 提供的 `monkeypatch`。
 - **返回**：无；断言失败时测试失败。
-- **主要过程**：临时设置四个环境变量，创建 `Settings`，再核对解析结果。
+- **主要过程**：临时设置应用、数据库和三个 Worker 环境变量，创建 `Settings`，再核对解析结果。
 - **失败情况**：任一配置没有正确读取或转换时断言失败。
 - **副作用**：只在当前测试期间临时修改环境变量。
 
@@ -703,3 +832,267 @@
 - **主要过程**：让同一任务先收到 `503` 再收到 `200`，比较两次请求 Header。
 - **失败情况**：两次 ID 不同或结果分类错误时测试失败。
 - **副作用**：只访问内存 mock。
+
+---
+
+<a id="test-worker-repository"></a>
+
+### Worker 数据库测试：`tests/test_worker_repository.py`
+
+#### `make_job(**overrides)`
+
+- **用途**：创建 Worker 数据库测试使用的完整内存任务。
+- **输入**：可选字段覆盖值。
+- **返回**：一个 `NotificationJob`。
+- **主要过程**：填入正常默认字段后应用覆盖值。
+- **失败情况**：错误字段会导致模型构造失败。
+- **副作用**：无。
+
+#### `fake_session_with_scalars(items)`
+
+- **用途**：模拟返回指定任务列表的异步数据库 session。
+- **输入**：希望查询返回的对象列表。
+- **返回**：带有 execute、commit 和 rollback mock 的 session。
+- **主要过程**：搭建 SQLAlchemy 查询结果的 `scalars()` 调用链。
+- **失败情况**：mock 接口与生产代码不一致时测试会失败。
+- **副作用**：无。
+
+#### `test_retry_delay_uses_capped_exponential_backoff(attempt_count, expected_minutes)`
+
+- **用途**：验证退避顺序为 1、2、4、8 分钟并封顶。
+- **输入**：pytest 提供的尝试次数和期望分钟数。
+- **返回**：无。
+- **主要过程**：比较 `retry_delay()` 的结果。
+- **失败情况**：任何档位不一致时测试失败。
+- **副作用**：无。
+
+#### `test_claim_due_notifications_marks_and_commits_jobs()`
+
+- **用途**：验证领取会设置状态、租约和尝试次数并提交。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：让 mock 查询返回两个任务，再检查修改和 commit。
+- **失败情况**：领取没有持久化或字段错误时测试失败。
+- **副作用**：只操作 mock。
+
+#### `test_record_delivery_result_applies_state_transition(delivery_result, attempt_count, expected_status, expected_delay)`
+
+- **用途**：验证成功、重试、永久失败和次数耗尽四种转换。
+- **输入**：pytest 提供的结果、次数、状态和延迟。
+- **返回**：无。
+- **主要过程**：记录结果并检查任务全部相关字段。
+- **失败情况**：状态、时间或错误信息不正确时测试失败。
+- **副作用**：只操作 mock。
+
+#### `test_record_delivery_result_ignores_expired_lease()`
+
+- **用途**：验证迟到 Worker 不能覆盖已更换租约的任务。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：传入旧租约，检查函数回滚且没有 commit。
+- **失败情况**：旧结果被写入时测试失败。
+- **副作用**：只操作 mock。
+
+#### `test_recover_stale_notifications_retries_or_kills_jobs()`
+
+- **用途**：验证过期任务按剩余次数进入 retrying 或 dead。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：恢复一条未到上限和一条已到上限的任务。
+- **失败情况**：状态、时间、租约或原因不正确时测试失败。
+- **副作用**：只操作 mock。
+
+---
+
+<a id="test-worker"></a>
+
+### Worker 循环测试：`tests/test_worker.py`
+
+#### `FakeSessionContext.__aenter__()`
+
+- **用途**：模拟进入 `async with session_maker()`。
+- **输入**：无。
+- **返回**：一个 mock session。
+- **主要过程**：创建并返回 `MagicMock`。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `FakeSessionContext.__aexit__(exc_type, exc_value, traceback)`
+
+- **用途**：模拟退出异步 session 上下文。
+- **输入**：可能出现的异常类型、值和回溯。
+- **返回**：`False`，表示不吞掉异常。
+- **主要过程**：直接返回固定值。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `fake_session_maker()`
+
+- **用途**：为 Worker 单元测试创建假的 session 上下文。
+- **输入**：无。
+- **返回**：`FakeSessionContext`。
+- **主要过程**：构造一个新上下文对象。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `make_claimed_job()`
+
+- **用途**：创建已经带租约的 processing 任务。
+- **输入**：无。
+- **返回**：完整的 `NotificationJob`。
+- **主要过程**：填入 UUID、当前时间和领取后的状态。
+- **失败情况**：模型字段变化未同步时测试失败。
+- **副作用**：无。
+
+#### `test_process_claimed_notification_delivers_then_records(monkeypatch)`
+
+- **用途**：验证单任务处理先发送，再记录结果。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：用两个嵌套 helper 记录事件顺序并检查租约参数。
+- **失败情况**：顺序或参数错误时测试失败。
+- **副作用**：不访问数据库或网络。
+
+#### `fake_deliver(notification, client)`
+
+- **用途**：上一个测试中模拟外部投递并记录事件。
+- **输入**：通知和 HTTP client 占位值。
+- **返回**：一个投递结果 mock。
+- **主要过程**：加入 `delivered` 事件。
+- **失败情况**：无。
+- **副作用**：修改测试事件列表。
+
+#### `fake_record(session, **kwargs)`
+
+- **用途**：上一个测试中模拟结果落库并核对任务与租约。
+- **输入**：session 占位值和结果参数。
+- **返回**：`True`。
+- **主要过程**：加入 `recorded` 事件并执行断言。
+- **失败情况**：任务 ID 或租约错误时断言失败。
+- **副作用**：修改测试事件列表。
+
+#### `test_run_worker_cycle_claims_before_network(monkeypatch)`
+
+- **用途**：验证领取提交完成后才开始网络阶段。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：替换恢复、领取和处理函数，检查事件严格排序。
+- **失败情况**：网络先于领取完成时测试失败。
+- **副作用**：不访问数据库或网络。
+
+#### `fake_recover(session, **kwargs)`
+
+- **用途**：上一测试中模拟恢复阶段。
+- **输入**：session 和参数占位值。
+- **返回**：恢复数量 `0`。
+- **主要过程**：加入 `recovered` 事件。
+- **失败情况**：无。
+- **副作用**：修改测试事件列表。
+
+#### `fake_claim(session, **kwargs)`
+
+- **用途**：上一测试中模拟已经提交的领取阶段。
+- **输入**：session 和领取参数。
+- **返回**：一条测试任务。
+- **主要过程**：加入 `claim_committed` 事件。
+- **失败情况**：无。
+- **副作用**：修改测试事件列表。
+
+#### `fake_process(notification, **kwargs)`
+
+- **用途**：上一测试中模拟网络处理并检查前一步是领取提交。
+- **输入**：通知和依赖参数。
+- **返回**：无。
+- **主要过程**：断言事件顺序并加入 `network_started`。
+- **失败情况**：领取未先完成时断言失败。
+- **副作用**：修改测试事件列表。
+
+#### `test_run_worker_cycle_processes_claimed_batch_concurrently(monkeypatch)`
+
+- **用途**：验证同一批任务会并发开始，慢请求不会让后续任务租约空等。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：让两个任务互相等待“都已开始”事件，只有并发实现才能在超时前完成。
+- **失败情况**：任务按顺序运行或有任务未开始时测试失败。
+- **副作用**：不访问数据库或网络。
+
+#### `fake_recover_for_concurrency(session, **kwargs)`
+
+- **用途**：并发测试中模拟无过期任务的恢复阶段。
+- **输入**：session 和参数占位值。
+- **返回**：`0`。
+- **主要过程**：直接返回。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `fake_claim_for_concurrency(session, **kwargs)`
+
+- **用途**：并发测试中返回两条已领取任务。
+- **输入**：session 和参数占位值。
+- **返回**：测试准备的任务列表。
+- **主要过程**：直接返回列表。
+- **失败情况**：无。
+- **副作用**：无。
+
+#### `blocking_process(notification, **kwargs)`
+
+- **用途**：并发测试中让每条任务等待整批都已开始。
+- **输入**：当前通知和依赖占位值。
+- **返回**：无。
+- **主要过程**：增加开始计数，第二条启动时设置事件，再等待该事件。
+- **失败情况**：若实现是串行，第一条会在 0.2 秒后超时。
+- **副作用**：修改测试计数和事件。
+
+#### `test_worker_loop_does_not_claim_after_stop(monkeypatch)`
+
+- **用途**：验证一轮中收到停止信号后不会开始下一轮。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：第一轮设置停止事件，再检查只执行一轮且没有等待。
+- **失败情况**：再次领取或等待时测试失败。
+- **副作用**：只修改测试停止事件。
+
+#### `stop_during_first_cycle(**kwargs)`
+
+- **用途**：上一测试中模拟执行一轮时收到停止请求。
+- **输入**：Worker cycle 参数。
+- **返回**：处理数量 `0`。
+- **主要过程**：设置停止事件。
+- **失败情况**：无。
+- **副作用**：改变测试停止事件。
+
+#### `test_worker_loop_with_preexisting_stop_does_nothing(monkeypatch)`
+
+- **用途**：验证启动前已有停止信号时不领取任务。
+- **输入**：pytest 的 `monkeypatch`。
+- **返回**：无。
+- **主要过程**：预先设置事件并检查 cycle 从未调用。
+- **失败情况**：Worker 仍开始工作时测试失败。
+- **副作用**：无外部副作用。
+
+#### `test_wait_for_next_cycle_wakes_on_stop()`
+
+- **用途**：验证 60 秒轮询等待可以被停止事件立即唤醒。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：并发等待和设置事件，再检查事件状态。
+- **失败情况**：等待未及时结束时测试超时或失败。
+- **副作用**：只修改测试事件。
+
+#### `request_stop()`
+
+- **用途**：上一测试中在让出一次事件循环后设置停止事件。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：短暂 yield 后调用 `set()`。
+- **失败情况**：无。
+- **副作用**：改变测试停止事件。
+
+#### `test_process_claimed_notification_requires_lease()`
+
+- **用途**：验证没有租约的任务不会被误发。
+- **输入**：无。
+- **返回**：无。
+- **主要过程**：清除 `locked_at` 并期待 `ValueError`。
+- **失败情况**：函数继续发送任务时测试失败。
+- **副作用**：不访问数据库或网络。

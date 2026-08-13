@@ -13,6 +13,9 @@ def test_settings_reads_environment_variables(monkeypatch) -> None:
         "postgresql+asyncpg://test:test@localhost:5432/test_notifications",
     )
     monkeypatch.setenv("DATABASE_ECHO", "true")
+    monkeypatch.setenv("WORKER_POLL_INTERVAL_SECONDS", "2.5")
+    monkeypatch.setenv("WORKER_BATCH_SIZE", "20")
+    monkeypatch.setenv("WORKER_LEASE_SECONDS", "90")
 
     settings = Settings(_env_file=None)
 
@@ -20,3 +23,6 @@ def test_settings_reads_environment_variables(monkeypatch) -> None:
     assert settings.environment == "test"
     assert settings.database_url.endswith("/test_notifications")
     assert settings.database_echo is True
+    assert settings.worker_poll_interval_seconds == 2.5
+    assert settings.worker_batch_size == 20
+    assert settings.worker_lease_seconds == 90
