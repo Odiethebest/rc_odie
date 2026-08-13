@@ -257,6 +257,8 @@ chore: add local container workflow and smoke test
 
 ## Batch 6：最终检查与交付
 
+**状态：已完成**
+
 **目标：确保代码、文档和作业要求完全一致。**
 
 ### 要完成的事情

@@ -94,7 +94,7 @@
 
 | 类 | 位置 | 用途 |
 |---|---|---|
-| `Settings` | `app/config.py` | 保存应用名称、运行环境和数据库连接等配置 |
+| `Settings` | `app/config.py` | 保存应用名称、数据库连接和 Worker 运行参数 |
 | `NotificationStatus` | `app/models.py` | 集中定义五种合法任务状态 |
 | `Base` | `app/models.py` | 汇总 SQLAlchemy 表结构，供 migration 使用 |
 | `NotificationJob` | `app/models.py` | 表示数据库中的一条通知任务 |
@@ -589,7 +589,7 @@
 - **用途**：确认环境变量可以覆盖开发环境默认配置。
 - **输入**：pytest 提供的 `monkeypatch`。
 - **返回**：无；断言失败时测试失败。
-- **主要过程**：临时设置应用、数据库和三个 Worker 环境变量，创建 `Settings`，再核对解析结果。
+- **主要过程**：临时设置应用、数据库和三个 Worker 环境变量，创建 `Settings`，再核对字符串、整数和小数的解析结果。
 - **失败情况**：任一配置没有正确读取或转换时断言失败。
 - **副作用**：只在当前测试期间临时修改环境变量。
 

@@ -46,9 +46,9 @@ This project moves that responsibility into one small internal service. A busine
 
 ## Implementation Status
 
-**Batch 5 is complete.** The full MVP delivery lifecycle is implemented and packaged as a reproducible Docker Compose environment with PostgreSQL, automatic migrations, the API, the Worker, and an offline mock vendor.
+**The MVP and final delivery audit are complete.** The full delivery lifecycle is implemented and packaged as a reproducible Docker Compose environment with PostgreSQL, automatic migrations, the API, the Worker, and an offline mock vendor.
 
-The remaining Batch 6 work is a final consistency, security, and submission audit. The implementation order and exit criteria are defined in [`Plan.md`](Plan.md).
+The implementation order and completed exit criteria are recorded in [`Plan.md`](Plan.md).
 
 ---
 
@@ -234,12 +234,12 @@ Vendors that support idempotency can use this value to reject duplicate processi
 | HTTP `2xx` | Mark `succeeded` |
 | Network error or timeout | Retry |
 | HTTP `408`, `429`, or `5xx` | Retry |
-| Redirects and other HTTP `4xx` | Mark `dead` because the request is unlikely to succeed unchanged |
+| Redirects and non-retryable HTTP responses | Mark `dead` because the request is unlikely to succeed unchanged |
 | Maximum attempts reached | Mark `dead` and retain the last error |
 
 The MVP makes at most five delivery attempts. Retries use capped exponential delays of approximately 1, 2, 4, and 8 minutes. Each outbound request has a 10-second timeout.
 
-The worker stores only a bounded error message and the latest HTTP status code. Authorization headers are never written to application logs.
+The worker stores only a bounded error message and the latest HTTP status code. Application logs contain job IDs and exception types, never request headers or bodies. SQL statement echo is deliberately disabled because SQL parameters may contain stored credentials.
 
 ### Long Vendor Outages
 
@@ -290,7 +290,7 @@ Workers claim due rows with `SELECT ... FOR UPDATE SKIP LOCKED`, mark them as `p
 │   └── worker_repository.py # Claim, retry, completion, and recovery transitions
 ├── migrations/
 │   └── versions/            # Alembic database revisions
-├── tests/                   # Configuration, model, repository, and API tests
+├── tests/                   # Unit tests for the API, delivery, worker, and mock vendor
 ├── .env.example             # Local configuration template
 ├── .dockerignore            # Small and secret-free Docker build context
 ├── alembic.ini              # Migration configuration
@@ -454,7 +454,7 @@ With the Worker running, the status moves from `pending` through `processing` to
 curl http://localhost:9000/received/<notification-id>
 ```
 
-To exercise failure handling, submit the same request with one of these target URLs:
+To exercise failure handling, submit another request with one of these target URLs. Use a new `Idempotency-Key` for each target; reusing `smoke-test-1` with a changed URL correctly returns `409 Conflict`.
 
 | Target URL | Expected status |
 |---|---|
@@ -499,7 +499,7 @@ Exactly-once side effects cannot be guaranteed across an ordinary HTTP boundary.
 - retry scheduling and terminal failure records
 - duplicate-safe job submission
 - status lookup
-- basic health checks and structured logs
+- database-aware health checks
 
 ### Intentionally Excluded
 
@@ -538,14 +538,15 @@ This path preserves the simple API contract while allowing the delivery implemen
 
 ## AI Use Disclosure
 
-AI was used as an engineering assistant during requirement analysis and design documentation.
+AI was used as an engineering assistant throughout requirement analysis, implementation, testing, container setup, and documentation. Its output was treated as a draft: the author reviewed the code, corrected inconsistencies, and ran the automated and real Docker workflows before accepting it.
 
 ### Where AI Helped
 
 - summarized the assignment into an API, durable job store, and background delivery flow
 - compared PostgreSQL-based job claiming with dedicated queue technologies
 - identified failure cases such as timeouts, ambiguous delivery outcomes, duplicate requests, and worker crashes
-- helped organize the README and make the design easier to review
+- drafted implementation scaffolding, unit tests, Docker configuration, and documentation that the author then reviewed and revised
+- helped audit the final repository for mismatches between documented behavior and executable code
 
 ### Suggestions Not Adopted
 
@@ -556,6 +557,8 @@ AI was used as an engineering assistant during requirement analysis and design d
 
 ### Human Decisions
 
-The author chose FastAPI and PostgreSQL, intentionally limited the first version to one API service and one worker, selected at-least-once delivery, and bounded retries instead of retrying forever. These decisions prioritize a small, testable, and explainable system over a feature-complete platform.
+The author chose FastAPI and PostgreSQL and required the design to remain simple enough to explain function by function. The author approved PostgreSQL row locking as the first-version queue because the assignment gives no scale requirement that justifies operating another data system. The author also chose at-least-once delivery, five bounded attempts, and visible `dead` jobs because these rules are honest about ambiguous HTTP failures and prevent an unavailable vendor from growing the queue forever.
+
+The author kept authentication, SSRF controls, secret-manager integration, alerting, and manual replay outside the demo only after documenting why they are required before production use. These decisions, along with the tests and end-to-end results, were reviewed against the original assignment rather than accepted solely because AI suggested them.
 
 AI-generated suggestions and text were reviewed and may be revised during implementation so that this document remains consistent with the actual code.

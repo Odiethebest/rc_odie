@@ -22,7 +22,7 @@ class DeliveryOutcome(StrEnum):
 
 @dataclass(frozen=True)
 class DeliveryResult:
-    """Small result used by the future worker to update job state."""
+    """Small result used by the worker to update job state."""
 
     outcome: DeliveryOutcome
     status_code: int | None = None

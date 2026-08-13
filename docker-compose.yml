@@ -28,7 +28,6 @@ services:
     build: .
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
-      ENVIRONMENT: development
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-notification_service}
     ports:
       - "${API_PORT:-8000}:8000"
@@ -46,7 +45,6 @@ services:
     command: ["python", "-m", "app.worker"]
     init: true
     environment:
-      ENVIRONMENT: development
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-notification_service}
       WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
       WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
